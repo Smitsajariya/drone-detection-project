@@ -1,6 +1,6 @@
 # Vision-Based Real-Time Drone Detection
 
-**Smit Sakariya** · think3ddd Berlin
+**Smit Sakariya**
 
 A software-only system that detects drones in a video feed and reports where they are, frame by frame. It's built as a virtual simulator plus a working detector. There's no RF hardware and no jamming, so the whole project stays safe, legal and reproducible on a laptop.
 
