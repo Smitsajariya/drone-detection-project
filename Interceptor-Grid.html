@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+  :root { color-scheme: light; padding-top: env(safe-area-inset-top,0); padding-bottom: env(safe-area-inset-bottom,0); }
+  html,body{margin:0}
+  body{font:14px system-ui,-apple-system,"Segoe UI",sans-serif}
+  img{max-width:100%}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<title>Interceptor Grid</title>
+<style>
+  /* Layout: full-bleed 3D scene with a fixed HUD rail (telemetry left, sensor log right), command bar on top */
+  :root {
+    --void: #070b10;
+    --panel: #0d141c;
+    --panel-2: #121b25;
+    --line: #1f2d3a;
+    --fg: #c6d4e0;
+    --fg-dim: #6c8296;
+    --grid: #17b8a6;      /* radar / interceptor cyan-green */
+    --threat: #ff4d5e;    /* hostile drone */
+    --lock: #ffc24b;      /* lock / aiming amber */
+    --ok: #3ddc84;        /* neutralized / confirmed */
+    --accent: #17b8a6;
+    color-scheme: dark;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --sans: "Chakra Petch", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--void);
+    color: var(--fg);
+    font-family: var(--sans);
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  #stage { position: fixed; inset: 0; }
+  canvas { display: block; }
+
+  /* ---- Command bar ---- */
+  #bar {
+    position: fixed; left: 0; right: 0;
+    top: env(safe-area-inset-top, 0px);
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px 16px;
+    background: linear-gradient(180deg, rgba(7,11,16,.92), rgba(7,11,16,.55));
+    border-bottom: 1px solid var(--line);
+    z-index: 20;
+    flex-wrap: wrap;
+  }
+  #bar .title {
+    font-family: var(--mono);
+    font-weight: 600; font-size: 13px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--fg);
+  }
+  #bar .title b { color: var(--grid); }
+  #bar .sub {
+    font-family: var(--mono); font-size: 10.5px; color: var(--fg-dim);
+    letter-spacing: .08em;
+  }
+  #bar .spacer { flex: 1 1 auto; }
+  .btn {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase;
+    background: var(--panel-2); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 3px;
+    padding: 7px 12px; cursor: pointer;
+    transition: border-color .15s, color .15s, background .15s;
+  }
+  .btn:hover { border-color: var(--grid); color: var(--grid); }
+  .btn:focus-visible { outline: 2px solid var(--grid); outline-offset: 2px; }
+  .btn[aria-pressed="true"] { background: var(--grid); color: var(--void); border-color: var(--grid); }
+
+  /* ---- HUD panels ---- */
+  .hud {
+    position: fixed; z-index: 15;
+    font-family: var(--mono);
+    background: rgba(9,14,20,.82);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    backdrop-filter: blur(3px);
+  }
+  #telemetry { left: 16px; top: 84px; width: 210px; padding: 12px 13px; }
+  #sensorlog { right: 16px; top: 84px; width: 236px; padding: 12px 13px; }
+
+  .hud h2 {
+    margin: 0 0 9px; font-size: 10px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--fg-dim); font-weight: 600;
+    display: flex; align-items: center; gap: 7px;
+  }
+  .hud h2::before {
+    content: ""; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--grid); box-shadow: 0 0 6px var(--grid);
+  }
+  .row {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 11.5px; padding: 3px 0; gap: 8px;
+  }
+  .row .k { color: var(--fg-dim); letter-spacing: .04em; }
+  .row .v { color: var(--fg); font-variant-numeric: tabular-nums; }
+  .v.hot { color: var(--threat); }
+  .v.lock { color: var(--lock); }
+  .v.ok { color: var(--ok); }
+
+  /* phase pills */
+  .phase {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 10.5px; letter-spacing: .08em;
+    padding: 3px 8px; border-radius: 3px; border: 1px solid var(--line);
+    color: var(--fg-dim); text-transform: uppercase;
+  }
+  .phase.active { color: var(--void); background: var(--acc, var(--grid)); border-color: transparent; }
+  #phaseflow { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 4px; }
+
+  /* sensor log lines */
+  #loglines { display: flex; flex-direction: column; gap: 0; max-height: 210px; overflow: hidden; }
+  .logline {
+    font-size: 10.5px; padding: 2.5px 0; letter-spacing: .02em;
+    display: flex; gap: 7px; border-bottom: 1px solid rgba(31,45,58,.4);
+    animation: fadein .25s ease;
+  }
+  .logline .t { color: var(--fg-dim); flex: 0 0 auto; }
+  .logline .m { color: var(--fg); min-width: 0; }
+  .logline.threat .m { color: var(--threat); }
+  .logline.lock .m { color: var(--lock); }
+  .logline.ok .m { color: var(--ok); }
+  @keyframes fadein { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+
+  /* bands readout */
+  #bands { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
+  .band { display: flex; align-items: center; gap: 7px; font-size: 10.5px; padding: 2px 0; }
+  .band .led { width: 7px; height: 7px; border-radius: 1px; background: var(--line); flex: 0 0 auto; }
+  .band.on .led { background: var(--lock); box-shadow: 0 0 5px var(--lock); }
+  .band.on .lbl { color: var(--lock); }
+  .band .lbl { color: var(--fg-dim); letter-spacing: .05em; }
+  .band .hz { margin-left: auto; color: var(--fg-dim); }
+
+  /* legend / footnote */
+  #note {
+    position: fixed; left: 16px; bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    z-index: 15; font-family: var(--mono); font-size: 9.5px; color: var(--fg-dim);
+    letter-spacing: .05em; max-width: 300px; line-height: 1.5;
+  }
+  #note b { color: var(--fg); font-weight: 600; }
+
+  /* range caption bottom-right */
+  #rangecaption {
+    position: fixed; right: 16px; bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    z-index: 15; font-family: var(--mono); font-size: 10px; color: var(--fg-dim);
+    text-align: right; letter-spacing: .05em;
+  }
+  #rangecaption b { color: var(--grid); }
+
+  @media (max-width: 760px) {
+    #telemetry { width: 160px; top: 108px; padding: 10px; }
+    #sensorlog { display: none; }
+    #note { max-width: 180px; }
+    #bar { padding: 8px 12px; gap: 9px; }
+    #bar .sub { display: none; }
+  }
+  @media (max-width: 420px) {
+    #telemetry { width: 144px; }
+    #rangecaption { font-size: 9px; }
+  }
+</style>
+
+<div id="stage"></div>
+
+<div id="bar">
+  <span class="title">THINK3DDD · <b>INTERCEPTOR GRID</b></span>
+  <span class="sub" id="clock">T+00:00</span>
+  <span class="spacer"></span>
+  <button class="btn" id="btnSpawn">Spawn threat</button>
+  <button class="btn" id="btnCam">View: orbit</button>
+  <button class="btn" id="btnPause" aria-pressed="false">Pause</button>
+</div>
+
+<section class="hud" id="telemetry" aria-live="off">
+  <h2>Interceptor · INT-01</h2>
+  <div class="row"><span class="k">STATE</span><span class="v" id="tState">PATROL</span></div>
+  <div class="row"><span class="k">TARGET</span><span class="v" id="tTarget">—</span></div>
+  <div class="row"><span class="k">SLANT RNG</span><span class="v" id="tRange">— m</span></div>
+  <div class="row"><span class="k">CLOSURE</span><span class="v" id="tClosure">— m/s</span></div>
+  <div class="row"><span class="k">REL ALT (Z)</span><span class="v" id="tAlt">— m</span></div>
+  <div class="row"><span class="k">YOLO CONF</span><span class="v" id="tConf">—</span></div>
+  <div id="phaseflow" aria-label="engagement phase">
+    <span class="phase" data-ph="SCAN" style="--acc:var(--grid)">scan</span>
+    <span class="phase" data-ph="DETECT" style="--acc:var(--grid)">detect</span>
+    <span class="phase" data-ph="TRACK" style="--acc:var(--lock)">track</span>
+    <span class="phase" data-ph="LOCK" style="--acc:var(--lock)">lock</span>
+    <span class="phase" data-ph="NEUTRAL" style="--acc:var(--ok)">neutralize</span>
+  </div>
+  <div id="bands">
+    <div class="band" data-band="24"><span class="led"></span><span class="lbl">2.4 GHz CTRL</span><span class="hz">ISM</span></div>
+    <div class="band" data-band="58"><span class="led"></span><span class="lbl">5.8 GHz VIDEO</span><span class="hz">FPV</span></div>
+    <div class="band" data-band="gnss"><span class="led"></span><span class="lbl">GNSS L1/L2</span><span class="hz">NAV</span></div>
+  </div>
+</section>
+
+<section class="hud" id="sensorlog" aria-live="off">
+  <h2>Sensor fusion log</h2>
+  <div id="loglines"></div>
+</section>
+
+<div id="note">
+  <b>Simulation.</b> Radar cue → LiDAR+camera fusion → YOLO detect → Kalman track → aim → effect.
+  No RF is emitted; "neutralize" is modeled, not performed.
+</div>
+<div id="rangecaption">
+  Effective envelope <b>~40 m</b> (720p) · <b>~50 m</b> (1080p)<br>
+  sensor model after Santos 2021, IST Lisbon
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.min.js"></script>
+<script>
+(function () {
+  "use strict";
+  const THREE = window.THREE;
+  const stage = document.getElementById("stage");
+
+  // ---------- palette (read from CSS tokens) ----------
+  const css = getComputedStyle(document.documentElement);
+  const C = {
+    void:   new THREE.Color(css.getPropertyValue("--void").trim() || "#070b10"),
+    grid:   new THREE.Color(css.getPropertyValue("--grid").trim() || "#17b8a6"),
+    threat: new THREE.Color(css.getPropertyValue("--threat").trim() || "#ff4d5e"),
+    lock:   new THREE.Color(css.getPropertyValue("--lock").trim() || "#ffc24b"),
+    ok:     new THREE.Color(css.getPropertyValue("--ok").trim() || "#3ddc84"),
+    dim:    new THREE.Color("#2a3b4a")
+  };
+
+  // ---------- scene ----------
+  const scene = new THREE.Scene();
+  scene.background = C.void.clone();
+  scene.fog = new THREE.FogExp2(C.void.clone(), 0.0065);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  stage.appendChild(renderer.domElement);
+
+  const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 2000);
+
+  // lights
+  scene.add(new THREE.AmbientLight(0x30465a, 1.1));
+  const key = new THREE.DirectionalLight(0x9fd8ff, 0.5);
+  key.position.set(40, 90, 30);
+  scene.add(key);
+
+  // ---------- ground grid ----------
+  const WORLD = 220;
+  const grid = new THREE.GridHelper(WORLD, 44, C.grid.clone(), C.dim.clone());
+  grid.material.transparent = true;
+  grid.material.opacity = 0.32;
+  scene.add(grid);
+
+  // subtle solid plane under the grid
+  const planeMat = new THREE.MeshBasicMaterial({ color: 0x0a1118, transparent: true, opacity: 0.9 });
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(WORLD, WORLD), planeMat);
+  plane.rotation.x = -Math.PI / 2;
+  plane.position.y = -0.05;
+  scene.add(plane);
+
+  // concentric range rings around the base station, labeled by effective envelope
+  const RANGE_RINGS = [20, 40, 50];
+  RANGE_RINGS.forEach((r, i) => {
+    const geo = new THREE.RingGeometry(r - 0.18, r + 0.18, 128);
+    const col = r <= 40 ? C.grid : C.lock;
+    const m = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: r === 50 ? 0.18 : 0.26, side: THREE.DoubleSide });
+    const ring = new THREE.Mesh(geo, m);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.02;
+    scene.add(ring);
+  });
+
+  // ---------- base / ground station (radar + heavy LiDAR, design: ground does long-range cueing) ----------
+  const base = new THREE.Group();
+  const mast = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.25, 0.4, 6, 8),
+    new THREE.MeshStandardMaterial({ color: 0x1b2a38, emissive: 0x071018 })
+  );
+  mast.position.y = 3;
+  base.add(mast);
+  const dish = new THREE.Mesh(
+    new THREE.SphereGeometry(1.4, 16, 12, 0, Math.PI * 2, 0, Math.PI / 2),
+    new THREE.MeshStandardMaterial({ color: 0x24384a, metalness: 0.3, roughness: 0.5, side: THREE.DoubleSide })
+  );
+  dish.position.y = 6;
+  dish.rotation.x = Math.PI;
+  base.add(dish);
+  scene.add(base);
+
+  // rotating radar sweep (ground station)
+  const sweepGeo = new THREE.CircleGeometry(50, 48, 0, Math.PI / 5);
+  const sweepMat = new THREE.MeshBasicMaterial({ color: C.grid, transparent: true, opacity: 0.08, side: THREE.DoubleSide });
+  const sweep = new THREE.Mesh(sweepGeo, sweepMat);
+  sweep.rotation.x = -Math.PI / 2;
+  sweep.position.y = 0.05;
+  scene.add(sweep);
+
+  // ---------- drone factory ----------
+  function makeQuad(bodyColor, scale) {
+    const g = new THREE.Group();
+    const bodyMat = new THREE.MeshStandardMaterial({ color: bodyColor, emissive: new THREE.Color(bodyColor).multiplyScalar(0.25), metalness: 0.4, roughness: 0.5 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.4, 1.1), bodyMat);
+    g.add(body);
+    const armMat = new THREE.MeshStandardMaterial({ color: 0x1a2630 });
+    const rotors = [];
+    const d = 1.0;
+    [[d, d], [-d, d], [d, -d], [-d, -d]].forEach(([x, z]) => {
+      const arm = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, Math.hypot(x, z) * 1.3), armMat);
+      arm.position.set(x / 2, 0, z / 2);
+      arm.lookAt(0, 0, 0);
+      g.add(arm);
+      const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.12, 8), armMat);
+      hub.position.set(x, 0.08, z);
+      g.add(hub);
+      const rotor = new THREE.Mesh(
+        new THREE.CircleGeometry(0.5, 20),
+        new THREE.MeshBasicMaterial({ color: bodyColor, transparent: true, opacity: 0.18, side: THREE.DoubleSide })
+      );
+      rotor.rotation.x = -Math.PI / 2;
+      rotor.position.set(x, 0.16, z);
+      g.add(rotor);
+      rotors.push(rotor);
+    });
+    g.scale.setScalar(scale);
+    g.userData.rotors = rotors;
+    return g;
+  }
+
+  // ---------- interceptor (ours) ----------
+  const interceptor = makeQuad(C.grid.getHex(), 1.0);
+  scene.add(interceptor);
+  const intState = {
+    pos: new THREE.Vector3(14, 10, 0),
+    vel: new THREE.Vector3(),
+    patrolAngle: 0,
+    maxSpeed: 30,     // m/s, faster than target (pursuer must out-speed the target)
+  };
+  interceptor.position.copy(intState.pos);
+
+  // sensor cone (camera FOV ~90deg horizontal) from interceptor
+  const coneGeo = new THREE.ConeGeometry(14, 34, 24, 1, true);
+  const coneMat = new THREE.MeshBasicMaterial({ color: C.grid, transparent: true, opacity: 0.045, side: THREE.DoubleSide });
+  const cone = new THREE.Mesh(coneGeo, coneMat);
+  scene.add(cone);
+
+  // lock beam (interceptor -> target), only visible in LOCK/NEUTRAL
+  const beamMat = new THREE.LineBasicMaterial({ color: C.lock, transparent: true, opacity: 0.9 });
+  const beamGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+  const beam = new THREE.Line(beamGeo, beamMat);
+  beam.visible = false;
+  scene.add(beam);
+
+  // ---------- threats ----------
+  const threats = [];
+  let threatSeq = 0;
+  function spawnThreat() {
+    threatSeq++;
+    const ang = Math.random() * Math.PI * 2;
+    const dist = 70 + Math.random() * 30;
+    const mesh = makeQuad(C.threat.getHex(), 0.85);
+    const pos = new THREE.Vector3(Math.cos(ang) * dist, 16 + Math.random() * 18, Math.sin(ang) * dist);
+    mesh.position.copy(pos);
+    scene.add(mesh);
+    // ring marker drawn on ground under threat
+    const t = {
+      id: "HOSTILE-" + String(threatSeq).padStart(2, "0"),
+      mesh, pos,
+      vel: new THREE.Vector3(),
+      // wandering intent toward the protected zone
+      wobble: Math.random() * Math.PI * 2,
+      speed: 7 + Math.random() * 6,     // consumer drone 7-13 m/s
+      phase: "SCAN",
+      conf: 0,
+      detectedAt: 0,
+      kalman: pos.clone(),              // smoothed estimate
+      alive: true,
+      neutralTimer: 0,
+      bbox: null,
+    };
+    threats.push(t);
+    log(t.id + " radar return, bearing " + Math.round(ang * 180 / Math.PI) + "°", "");
+    return t;
+  }
+
+  // one threat to start, so the page opens in a working state
+  const firstThreat = spawnThreat();
+
+  // ---------- engagement state machine ----------
+  let locked = null;   // current target we're servicing
+  const PHASES = ["SCAN", "DETECT", "TRACK", "LOCK", "NEUTRAL"];
+
+  // ---------- HUD refs ----------
+  const el = {
+    state: document.getElementById("tState"),
+    target: document.getElementById("tTarget"),
+    range: document.getElementById("tRange"),
+    closure: document.getElementById("tClosure"),
+    alt: document.getElementById("tAlt"),
+    conf: document.getElementById("tConf"),
+    clock: document.getElementById("clock"),
+    phases: Array.from(document.querySelectorAll("#phaseflow .phase")),
+    bands: { "24": document.querySelector('[data-band="24"]'), "58": document.querySelector('[data-band="58"]'), "gnss": document.querySelector('[data-band="gnss"]') },
+    log: document.getElementById("loglines"),
+  };
+
+  let logCount = 0;
+  function log(msg, cls) {
+    logCount++;
+    const line = document.createElement("div");
+    line.className = "logline" + (cls ? " " + cls : "");
+    line.innerHTML = '<span class="t">' + fmtClock(simTime) + '</span><span class="m"></span>';
+    line.querySelector(".m").textContent = msg;
+    el.log.insertBefore(line, el.log.firstChild);
+    while (el.log.children.length > 9) el.log.removeChild(el.log.lastChild);
+  }
+
+  function setPhase(ph) {
+    el.phases.forEach(p => p.classList.toggle("active", p.dataset.ph === ph));
+    const on = (ph === "LOCK" || ph === "NEUTRAL");
+    el.bands["24"].classList.toggle("on", on);
+    el.bands["58"].classList.toggle("on", on);
+    el.bands["gnss"].classList.toggle("on", ph === "NEUTRAL");
+  }
+
+  // ---------- camera control: orbit + chase ----------
+  let camMode = "orbit";
+  let orbitAngle = 0.6, orbitTarget = 0.6;
+  const camBtn = document.getElementById("btnCam");
+  camBtn.addEventListener("click", () => {
+    camMode = camMode === "orbit" ? "chase" : "orbit";
+    camBtn.textContent = "View: " + camMode;
+  });
+  // drag to orbit
+  let dragging = false, lastX = 0;
+  renderer.domElement.addEventListener("pointerdown", e => { dragging = true; lastX = e.clientX; });
+  window.addEventListener("pointerup", () => dragging = false);
+  window.addEventListener("pointermove", e => {
+    if (!dragging) return;
+    orbitTarget += (e.clientX - lastX) * 0.005;
+    lastX = e.clientX;
+    if (camMode !== "orbit") { camMode = "orbit"; camBtn.textContent = "View: orbit"; }
+  });
+
+  // ---------- controls ----------
+  let paused = false;
+  const pauseBtn = document.getElementById("btnPause");
+  pauseBtn.addEventListener("click", () => {
+    paused = !paused;
+    pauseBtn.setAttribute("aria-pressed", String(paused));
+    pauseBtn.textContent = paused ? "Resume" : "Pause";
+  });
+  document.getElementById("btnSpawn").addEventListener("click", () => {
+    if (threats.filter(t => t.alive).length < 6) spawnThreat();
+  });
+
+  // ---------- helpers ----------
+  function fmtClock(s) {
+    const m = Math.floor(s / 60), ss = Math.floor(s % 60);
+    return "T+" + String(m).padStart(2, "0") + ":" + String(ss).padStart(2, "0");
+  }
+  const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---------- main loop ----------
+  let simTime = 0, last = performance.now();
+  function resize() {
+    const w = stage.clientWidth, h = stage.clientHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  const BASE = new THREE.Vector3(0, 0, 0);
+  const tmp = new THREE.Vector3();
+
+  function pickTarget() {
+    // service the closest live, not-yet-neutralized threat
+    let best = null, bestD = Infinity;
+    for (const t of threats) {
+      if (!t.alive || t.phase === "NEUTRAL") continue;
+      const d = interceptor.position.distanceTo(t.pos);
+      if (d < bestD) { bestD = d; best = t; }
+    }
+    return best;
+  }
+
+  function tick(now) {
+    const dtReal = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    const dt = paused ? 0 : dtReal;
+    simTime += dt;
+
+    // radar sweep
+    if (!paused) sweep.rotation.z -= dt * 1.6;
+
+    // rotors
+    if (!reduceMotion && !paused) {
+      interceptor.userData.rotors.forEach(r => r.rotation.z += dt * 40);
+      threats.forEach(t => t.alive && t.mesh.userData.rotors.forEach(r => r.rotation.z += dt * 36));
+    }
+
+    // ---- move threats ----
+    for (const t of threats) {
+      if (!t.alive) continue;
+      if (t.phase === "NEUTRAL") {
+        // spiral down to ground, then despawn
+        t.neutralTimer += dt;
+        t.pos.y = Math.max(0.6, t.pos.y - dt * 9);
+        t.mesh.rotation.z += dt * 6;
+        t.mesh.rotation.x += dt * 3;
+        t.mesh.position.copy(t.pos);
+        if (t.pos.y <= 0.7 && t.neutralTimer > 0.5) {
+          t.alive = false;
+          scene.remove(t.mesh);
+          log(t.id + " down · track terminated", "ok");
+        }
+        continue;
+      }
+      // wander toward protected zone with wobble
+      t.wobble += dt * 0.6;
+      const toBase = tmp.copy(BASE).sub(t.pos); toBase.y = 0;
+      const dHoriz = toBase.length();
+      toBase.normalize();
+      // perpendicular wobble
+      const perp = new THREE.Vector3(-toBase.z, 0, toBase.x).multiplyScalar(Math.sin(t.wobble) * 0.6);
+      const dir = toBase.multiplyScalar(dHoriz > 28 ? 1 : 0.1).add(perp).normalize();
+      t.vel.copy(dir).multiplyScalar(t.speed);
+      t.vel.y = Math.sin(t.wobble * 1.3) * 1.5;
+      t.pos.addScaledVector(t.vel, dt);
+      t.pos.y = Math.max(8, Math.min(40, t.pos.y));
+      t.mesh.position.copy(t.pos);
+    }
+
+    // ---- interceptor logic ----
+    if (!locked || !locked.alive || locked.phase === "NEUTRAL") locked = pickTarget();
+
+    let hudState = "PATROL", hudPhase = "SCAN";
+    if (!locked) {
+      // patrol: slow orbit at altitude
+      intState.patrolAngle += dt * 0.35;
+      const pr = 22;
+      const want = tmp.set(Math.cos(intState.patrolAngle) * pr, 12, Math.sin(intState.patrolAngle) * pr);
+      interceptor.position.lerp(want, 1 - Math.pow(0.001, dt));
+      setPhase("SCAN");
+    } else {
+      const t = locked;
+      const slant = interceptor.position.distanceTo(t.pos);
+
+      // phase transitions keyed to range envelope (design: radar cue far, camera/YOLO mid, lock near)
+      if (t.phase === "SCAN" && slant < 80) {
+        t.phase = "DETECT"; t.detectedAt = simTime;
+        log(t.id + " LiDAR cluster → ROI 416px", "");
+      }
+      if (t.phase === "DETECT") {
+        t.conf = Math.min(0.97, t.conf + dt * 0.9);
+        if (t.conf > 0.6) {
+          t.phase = "TRACK";
+          log(t.id + " YOLO confirm " + (t.conf * 100).toFixed(0) + "% · Kalman init", "");
+        }
+      }
+      if (t.phase === "TRACK") {
+        t.conf = Math.min(0.98, t.conf + dt * 0.4);
+        // Kalman-smoothed estimate chases true pos
+        t.kalman.lerp(t.pos, 1 - Math.pow(0.02, dt));
+        if (slant < 45) {
+          t.phase = "LOCK";
+          log(t.id + " LOCK · aim 2.4/5.8GHz + GNSS", "lock");
+        }
+      }
+      if (t.phase === "LOCK") {
+        t.conf = Math.min(0.99, t.conf + dt * 0.3);
+        t.kalman.lerp(t.pos, 1 - Math.pow(0.005, dt));
+        if (slant < 24) {
+          t.lockHold = (t.lockHold || 0) + dt;
+          if (t.lockHold > 1.1) {
+            t.phase = "NEUTRAL"; t.neutralTimer = 0;
+            log(t.id + " link severed · forced descent", "ok");
+          }
+        }
+      }
+
+      // interceptor flies to an intercept point ahead of target
+      const aim = tmp.copy(t.pos).addScaledVector(t.vel, 0.6);
+      const toAim = aim.sub(interceptor.position);
+      const step = Math.min(intState.maxSpeed * dt, toAim.length());
+      interceptor.position.addScaledVector(toAim.normalize(), step);
+
+      // HUD
+      hudState = t.phase === "NEUTRAL" ? "NEUTRALIZING" : "ENGAGE";
+      hudPhase = t.phase;
+      setPhase(t.phase);
+      el.target.textContent = t.id;
+      el.range.textContent = slant.toFixed(1) + " m";
+      const closure = -THREE.MathUtils.clamp((slant - (t._lastSlant ?? slant)) / Math.max(dt, 1e-3), -40, 40);
+      t._lastSlant = slant;
+      el.closure.textContent = (isFinite(closure) ? closure.toFixed(1) : "0.0") + " m/s";
+      el.alt.textContent = (t.pos.y - 0).toFixed(1) + " m";
+      el.conf.textContent = t.conf > 0.05 ? (t.conf * 100).toFixed(0) + "%" : "—";
+      el.conf.className = "v " + (t.phase === "NEUTRAL" ? "ok" : t.phase === "LOCK" ? "lock" : "");
+      el.range.className = "v " + (slant < 24 ? "lock" : slant < 45 ? "lock" : "hot");
+
+      // lock beam
+      if (t.phase === "LOCK" || t.phase === "NEUTRAL") {
+        beam.visible = true;
+        const p = beam.geometry.attributes.position;
+        p.setXYZ(0, interceptor.position.x, interceptor.position.y, interceptor.position.z);
+        p.setXYZ(1, t.pos.x, t.pos.y, t.pos.z);
+        p.needsUpdate = true;
+        beamMat.color.copy(t.phase === "NEUTRAL" ? C.ok : C.lock);
+      } else {
+        beam.visible = false;
+      }
+    }
+    if (!locked) {
+      beam.visible = false;
+      el.target.textContent = "—";
+      el.range.textContent = "— m"; el.range.className = "v";
+      el.closure.textContent = "— m/s";
+      el.alt.textContent = "— m";
+      el.conf.textContent = "—"; el.conf.className = "v";
+    }
+    el.state.textContent = hudState;
+    el.state.className = "v " + (hudState === "ENGAGE" ? "hot" : hudState === "NEUTRALIZING" ? "ok" : "");
+
+    // orient interceptor toward motion/target
+    if (locked && locked.alive) {
+      interceptor.lookAt(locked.pos.x, interceptor.position.y, locked.pos.z);
+    }
+    // sensor cone follows interceptor, pointing at target or forward
+    cone.position.copy(interceptor.position);
+    const look = locked && locked.alive ? locked.pos : tmp.copy(interceptor.position).add(new THREE.Vector3(Math.cos(intState.patrolAngle+Math.PI/2),0,Math.sin(intState.patrolAngle+Math.PI/2)));
+    cone.lookAt(look);
+    cone.rotateX(Math.PI / 2);
+    cone.translateY(-17);
+
+    // clock
+    el.clock.textContent = fmtClock(simTime);
+
+    // ---- camera ----
+    if (camMode === "orbit") {
+      orbitAngle += (orbitTarget - orbitAngle) * (1 - Math.pow(0.001, dtReal));
+      if (!dragging && !paused) orbitTarget += dtReal * 0.03;
+      const R = 95, H = 52;
+      camera.position.set(Math.cos(orbitAngle) * R, H, Math.sin(orbitAngle) * R);
+      camera.lookAt(0, 8, 0);
+    } else {
+      // chase cam behind interceptor
+      const behind = tmp.copy(interceptor.position).add(new THREE.Vector3(0, 6, 0));
+      const dir = locked && locked.alive ? tmp.copy(interceptor.position).sub(locked.pos).setY(0).normalize() : new THREE.Vector3(1,0,0);
+      behind.addScaledVector(dir, 16).setY(interceptor.position.y + 7);
+      camera.position.lerp(behind, 1 - Math.pow(0.0008, dtReal));
+      camera.lookAt(locked && locked.alive ? locked.pos : interceptor.position);
+    }
+
+    renderer.render(scene, camera);
+    requestAnimationFrame(tick);
+  }
+
+  // periodic auto-spawn so the scene stays active
+  setInterval(() => {
+    if (!paused && threats.filter(t => t.alive).length < 3 && Math.random() < 0.6) spawnThreat();
+  }, 6000);
+
+  // seed the log + initial HUD
+  setPhase("SCAN");
+  requestAnimationFrame(tick);
+})();
+</script>
+
+</body>
+</html>
