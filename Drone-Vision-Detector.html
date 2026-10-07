@@ -200,7 +200,8 @@
   // offscreen buffer we sample pixels from (downscaled for speed)
   const buf = document.createElement("canvas");
   const bctx = buf.getContext("2d", { willReadFrequently: true });
-  const PROC_W = 320;  // processing width
+  const PROC_W = 320;  // auto-detect processing width
+  const TRK_W = 480;   // click-track processing width (finer, so small drones keep their shape)
 
   document.getElementById("theme").addEventListener("click", () => {
     const r = document.documentElement, cur = r.getAttribute("data-theme");
@@ -224,7 +225,8 @@
   let running = false;
   let mode = "sample";        // "sample" (auto track json) | "track" (click template)
   let picking = false;         // waiting for user click
-  let template = null;         // {data, tw, th} grayscale patch in proc space
+  let template = null;         // {data, tw, th} grayscale patch (NCC fallback when the blob is lost)
+  let trk = null;              // click-track state: centre, velocity, size, misses
   let box = null;              // current norm bbox {x,y,w,h}
   let smooth = null;
   let lastConf = 0;
@@ -283,23 +285,128 @@
   }
 
   // ---- pixel helpers (grayscale in proc space) ----
-  function grabGray() {
+  function grabGray(width) {
     const vw = vid.videoWidth, vh = vid.videoHeight;
     if (!vw) return null;
-    const pw = PROC_W, ph = Math.round(PROC_W * vh / vw);
-    buf.width = pw; buf.height = ph;
+    const pw = width || PROC_W, ph = Math.round(pw * vh / vw);
+    if (buf.width !== pw || buf.height !== ph) { buf.width = pw; buf.height = ph; }
     bctx.drawImage(vid, 0, 0, pw, ph);
     const img = bctx.getImageData(0, 0, pw, ph);
-    const g = new Float32Array(pw * ph);
+    const g = new Float32Array(pw * ph), sat = new Float32Array(pw * ph);
     const d = img.data;
-    for (let i = 0, j = 0; i < d.length; i += 4, j++) g[j] = (d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114);
-    return { g, pw, ph };
+    for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+      g[j] = (d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114);
+      sat[j] = Math.max(d[i], d[i+1], d[i+2]) - Math.min(d[i], d[i+1], d[i+2]);   // colourfulness (blue sky is high)
+    }
+    return { g, sat, pw, ph };
   }
-  function extractTemplate(cxN, cyN, halfN) {
-    const f = grabGray(); if (!f) return;
+  // ---- small-target finder ----
+  // A drone is a small spot darker (or lighter) than the sky on ALL sides. Comparing each
+  // pixel to four patches around it (left/right/up/down) ignores cloud edges, where the
+  // sky is only darker than ONE neighbour, and picks out compact targets instead.
+  function integral(g, pw, ph) {
+    const W = pw + 1, I = new Float64Array(W * (ph + 1));
+    for (let y = 0; y < ph; y++) {
+      let row = 0;
+      for (let x = 0; x < pw; x++) { row += g[y*pw + x]; I[(y+1)*W + x + 1] = I[y*W + x + 1] + row; }
+    }
+    return I;
+  }
+  function boxMean(I, pw, ph, x, y, r) {
+    const x0 = Math.max(0, x - r), y0 = Math.max(0, y - r), x1 = Math.min(pw, x + r + 1), y1 = Math.min(ph, y + r + 1);
+    if (x1 <= x0 || y1 <= y0) return 255;
+    const W = pw + 1;
+    return (I[y1*W + x1] - I[y0*W + x1] - I[y1*W + x0] + I[y0*W + x0]) / ((x1 - x0) * (y1 - y0));
+  }
+  // all compact dark spots in a window around (cx,cy); ps = expected target size in px
+  function findCandidates(f, cx, cy, R, k, ps) {
     const { g, pw, ph } = f;
-    const tw = Math.max(8, Math.round(halfN*2*pw)), th = tw;
-    const sx = Math.round(cxN*pw - tw/2), sy = Math.round(cyN*ph - th/2);
+    const I = f.I || (f.I = integral(g, pw, ph));
+    const x0 = Math.max(0, Math.round(cx - R)), x1 = Math.min(pw - 1, Math.round(cx + R));
+    const y0 = Math.max(0, Math.round(cy - R)), y1 = Math.min(ph - 1, Math.round(cy + R));
+    const W = x1 - x0 + 1, H = y1 - y0 + 1;
+    if (W < 3 || H < 3) return [];
+    const r = Math.max(2, Math.round(k * 0.4));
+    const s = new Float32Array(W * H);
+    let tot = 0;
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const l = boxMean(I, pw, ph, x - k, y, r), rr = boxMean(I, pw, ph, x + k, y, r);
+      const u = boxMean(I, pw, ph, x, y - k, r), d = boxMean(I, pw, ph, x, y + k, r);
+      const v = g[y*pw + x];
+      const dark = Math.min(l, rr, u, d) - v;           // darker than every side
+      const sc = dark > 0 ? dark : 0;                   // (lighter spots are mostly cloud puffs)
+      s[(y - y0)*W + (x - x0)] = sc; tot += sc;
+    }
+    const thr = Math.max(10, 4 * tot / (W * H));
+    // candidates = sharp local peaks of darkness (they can't merge with a nearby dark band)
+    const nms = Math.max(2, Math.round(ps * 0.5)), h = Math.max(3, Math.round(ps * 0.8));
+    const peaks = [];
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+      const i = y*W + x, v = s[i];
+      if (v <= thr) continue;
+      if (v < s[i-1] || v < s[i+1] || v < s[i-W] || v < s[i+W] || v < s[i-W-1] || v < s[i-W+1] || v < s[i+W-1] || v < s[i+W+1]) continue;
+      peaks.push({ x, y, v });
+    }
+    peaks.sort((p, q) => q.v - p.v);
+    const kept = [];
+    for (const pk of peaks) {
+      if (kept.length >= 30) break;
+      if (kept.some(q => Math.abs(q.x - pk.x) <= nms && Math.abs(q.y - pk.y) <= nms)) continue;
+      kept.push(pk);
+    }
+    const comps = [];
+    for (const pk of kept) {
+      // centre on the whole spot around the peak (2 mean-shift passes)
+      if (x0 + pk.x < 3 || y0 + pk.y < 3 || x0 + pk.x > pw - 4 || y0 + pk.y > ph - 4) continue;   // frame edge artefacts
+      let px = pk.x, py = pk.y, mass = 0, minx = 0, maxx = 0, miny = 0, maxy = 0, gm = 255, st = 0, sn = 0;
+      for (let it = 0; it < 2; it++) {
+        mass = 0; let sx = 0, sy = 0; minx = 1e9; maxx = -1; miny = 1e9; maxy = -1; gm = 255; st = 0; sn = 0;
+        const ix = Math.round(px), iy = Math.round(py);
+        for (let y = Math.max(0, iy - h); y <= Math.min(H - 1, iy + h); y++)
+          for (let x = Math.max(0, ix - h); x <= Math.min(W - 1, ix + h); x++) {
+            const v = s[y*W + x]; if (v < pk.v * 0.35) continue;
+            mass += v; sx += v*x; sy += v*y;
+            if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+            const gi = (y0 + y)*pw + x0 + x, gv = g[gi]; if (gv < gm) gm = gv;
+            if (v >= pk.v * 0.6) { st += f.sat[gi]; sn++; }
+          }
+        if (mass > 0) { px = sx/mass; py = sy/mass; }
+      }
+      comps.push({ cx: x0 + px, cy: y0 + py, peak: pk.v, mass, gmin: gm, sat: sn ? st/sn : 0, w: maxx - minx + 1, h: maxy - miny + 1, thr });
+    }
+    return comps;
+  }
+  // best candidate near a prediction. opts: prevSize, tm (template), sigma (distance gate), gmin (target darkness)
+  function findBlob(f, cx, cy, R, k, opts) {
+    const { prevSize = 0, tm = null, sigma = 0, gmin = null, sat = null } = opts || {};
+    const comps = findCandidates(f, cx, cy, R, k, prevSize || 6);
+    if (!comps || !comps.length) return null;
+    const sig = sigma || Math.max(6, R * 0.5);
+    let best = null, bestScore = 0;
+    for (const c of comps) {
+      const dist = Math.hypot(c.cx - cx, c.cy - cy);
+      if (dist > R) continue;
+      if (gmin !== null && c.gmin > gmin + 45) continue;            // far lighter than the drone: sky or cloud
+      let sc = c.peak * Math.exp(-(dist*dist) / (2*sig*sig));
+      const sz = Math.max(c.w, c.h);
+      if (prevSize) sc *= Math.exp(-0.7 * Math.abs(Math.log((sz + 2) / (prevSize + 2))));
+      // a drone is a near-black silhouette; trees and sky gaps are lighter
+      if (gmin !== null) sc *= Math.exp(-Math.max(0, c.gmin - gmin) / 15);
+      // and grey/black, not sky-blue
+      if (sat !== null) sc *= Math.exp(-Math.max(0, c.sat - sat - 15) / 20);
+      // looks like the drone we locked onto?
+      if (tm) { c.ncc = nccAt(f, tm, c.cx, c.cy, 1).score; sc *= Math.max(0.2, c.ncc); }
+      if (sc > bestScore) { bestScore = sc; best = c; }
+    }
+    if (!best) return null;
+    return { cx: best.cx, cy: best.cy, w: best.w, h: best.h, contrast: best.peak / best.thr, gmin: best.gmin, sat: best.sat };
+  }
+
+  // ---- NCC template (fallback when the blob detector loses the target, e.g. over trees) ----
+  function makeTemplate(f, cx, cy, size) {
+    const { g, pw, ph } = f;
+    const tw = Math.max(12, Math.round(size * 2.2)), th = tw;
+    const sx = Math.round(cx - tw/2), sy = Math.round(cy - th/2);
     const data = new Float32Array(tw*th);
     let sum = 0;
     for (let y=0;y<th;y++) for (let x=0;x<tw;x++){
@@ -308,117 +415,132 @@
     }
     const mean = sum/(tw*th);
     let ss = 0; for (let i=0;i<data.length;i++){ data[i]-=mean; ss += data[i]*data[i]; }
-    template = { data, tw, th, norm: Math.sqrt(ss)||1 };
-    box = { x: sx/pw, y: sy/ph, w: tw/pw, h: th/ph };
-    smooth = Object.assign({}, box);
+    return { data, tw, th, norm: Math.sqrt(ss)||1 };
   }
-  // normalized cross-correlation search in a window around last box
-  function trackStep() {
-    if (!template) return null;
-    const f = grabGray(); if (!f) return null;
+  function nccAt(f, tm, cx, cy, search) {
     const { g, pw, ph } = f;
-    const { data, tw, th, norm } = template;
-    const cx = (smooth.x + smooth.w/2) * pw, cy = (smooth.y + smooth.h/2) * ph;
-    const search = Math.round(Math.max(tw, th) * 0.9) + 6;
-    const step = tw > 40 ? 2 : 1;
+    const { data, tw, th, norm } = tm;
+    const step = search > 30 ? 2 : 1;
     let best = -2, bx = cx, by = cy;
-    for (let oy=-search; oy<=search; oy+=step) {
-      for (let ox=-search; ox<=search; ox+=step) {
-        const sx = Math.round(cx + ox - tw/2), sy = Math.round(cy + oy - th/2);
-        if (sx<0||sy<0||sx+tw>=pw||sy+th>=ph) continue;
-        // mean of candidate
-        let sum=0; for (let y=0;y<th;y+=2) for (let x=0;x<tw;x+=2){ sum += g[(sy+y)*pw+sx+x]; }
-        const cnt = Math.ceil(th/2)*Math.ceil(tw/2); const m = sum/cnt;
-        let dot=0, ss=0;
-        for (let y=0;y<th;y+=2) for (let x=0;x<tw;x+=2){
-          const cv = g[(sy+y)*pw+sx+x]-m; const tv = data[y*tw+x];
-          dot += cv*tv; ss += cv*cv;
-        }
-        const denom = Math.sqrt(ss)*norm || 1;
-        const score = dot/denom;
-        if (score > best) { best = score; bx = cx+ox; by = cy+oy; }
+    for (let oy=-search; oy<=search; oy+=step) for (let ox=-search; ox<=search; ox+=step) {
+      const sx = Math.round(cx + ox - tw/2), sy = Math.round(cy + oy - th/2);
+      if (sx<0||sy<0||sx+tw>=pw||sy+th>=ph) continue;
+      let sum=0; for (let y=0;y<th;y+=2) for (let x=0;x<tw;x+=2) sum += g[(sy+y)*pw+sx+x];
+      const mean = sum / (Math.ceil(th/2)*Math.ceil(tw/2));
+      let dot=0, ss=0;
+      for (let y=0;y<th;y+=2) for (let x=0;x<tw;x+=2){
+        const cv = g[(sy+y)*pw+sx+x]-mean; dot += cv*data[y*tw+x]; ss += cv*cv;
       }
+      const score = dot / (Math.sqrt(ss)*norm || 1);
+      if (score > best) { best = score; bx = cx+ox; by = cy+oy; }
     }
-    lastConf = Math.max(0, Math.min(1, (best+1)/2));
-    const nb = { x: (bx - tw/2)/pw, y: (by - th/2)/ph, w: tw/pw, h: th/ph };
-    const a = 0.5;
-    smooth.x += (nb.x-smooth.x)*a; smooth.y += (nb.y-smooth.y)*a;
-    smooth.w = nb.w; smooth.h = nb.h;
-    return { box: smooth, conf: lastConf };
+    return { x: bx, y: by, score: best };
   }
 
-  // ---- AUTO DETECT: motion + dark-blob against sky (no model, runs in-browser) ----
-  // Keeps a running background; each frame finds the strongest compact region that
-  // differs from the background, favouring small darker blobs (a drone in the sky).
-  let bgGray = null, bgDims = null;
+  // ---- click-track: lock onto the blob under the click, then follow it ----
+  function startTrack(nx, ny) {
+    const f = grabGray(TRK_W); if (!f) return false;
+    const { pw, ph } = f;
+    const b = findBlob(f, nx*pw, ny*ph, pw*0.05, 8, { sigma: pw*0.02 });
+    trk = { cx: b ? b.cx/pw : nx, cy: b ? b.cy/ph : ny, vx: 0, vy: 0,
+            size: b ? Math.max(4, b.w, b.h) : 10, miss: 0, conf: b ? 0.8 : 0.4, n: 0, lastT: -1, last: null,
+            gmin: b ? b.gmin : null, sat: b ? b.sat : null };
+    template = makeTemplate(f, trk.cx*pw, trk.cy*ph, trk.size);
+    return !!b;
+  }
+  function trackBox() {
+    const pw = TRK_W, ph = Math.round(TRK_W * (vid.videoHeight||9) / (vid.videoWidth||16));
+    const side = Math.max(18, trk.size * 2.2);
+    return { x: trk.cx - side/2/pw, y: trk.cy - side/2/ph, w: side/pw, h: side/ph };
+  }
+  function trackStep() {
+    if (!trk) return null;
+    if (vid.currentTime === trk.lastT && trk.last) return trk.last;   // same video frame: nothing new
+    const f = grabGray(TRK_W); if (!f) return null;
+    const { pw, ph } = f;
+    trk.lastT = vid.currentTime;
+    const pcx = (trk.cx + trk.vx)*pw, pcy = (trk.cy + trk.vy)*ph;     // constant-velocity prediction
+    const speed = Math.hypot(trk.vx*pw, trk.vy*ph);
+    const R = Math.min(pw*0.15, (trk.size*2.5 + speed*2.5 + 14) * (1 + Math.min(trk.miss, 15)*0.12));
+    const k = Math.max(6, Math.round(trk.size*0.9) + 2);
+    const b = findBlob(f, pcx, pcy, R, k, { prevSize: trk.size, tm: template, gmin: trk.gmin, sat: trk.sat,
+                       sigma: Math.max(5, trk.size*1.5 + speed*1.5) * (1 + Math.min(trk.miss, 15)*0.12) });
+    let mx, my, conf;
+    if (b) {
+      mx = b.cx; my = b.cy;
+      conf = Math.max(0.4, Math.min(0.97, 0.62 + 0.12*Math.log2(b.contrast)));
+      trk.gmin = trk.gmin === null ? b.gmin : trk.gmin + (b.gmin - trk.gmin)*0.1;
+      trk.sat = trk.sat === null ? b.sat : trk.sat + (b.sat - trk.sat)*0.1;
+      const ns = Math.min(trk.size*1.15, Math.max(trk.size*0.87, Math.max(4, b.w, b.h)));   // size changes slowly
+      trk.size = Math.min(pw*0.12, trk.size + (ns - trk.size) * 0.3);
+    } else if (template) {
+      const m = nccAt(f, template, pcx, pcy, Math.round(Math.min(R, 40)));
+      if (m.score > 0.6) { mx = m.x; my = m.y; conf = 0.35 + 0.3*(m.score - 0.6)/0.4; }
+    }
+    if (mx !== undefined) {
+      const nx = mx/pw, ny = my/ph;
+      trk.vx = trk.vx*0.6 + (nx - trk.cx)*0.4; trk.vy = trk.vy*0.6 + (ny - trk.cy)*0.4;
+      trk.cx = nx; trk.cy = ny; trk.miss = 0; trk.conf = conf;
+      if (b && conf > 0.65 && (trk.n++ % 10) === 0) template = makeTemplate(f, mx, my, trk.size);
+    } else {
+      trk.cx += trk.vx; trk.cy += trk.vy; trk.vx *= 0.9; trk.vy *= 0.9;
+      trk.miss++; trk.conf = Math.max(0.1, trk.conf*0.85);
+    }
+    trk.cx = Math.min(1, Math.max(0, trk.cx)); trk.cy = Math.min(1, Math.max(0, trk.cy));
+    trk.last = { box: trackBox(), conf: trk.conf, lost: trk.miss > 45 };
+    return trk.last;
+  }
+
+  // ---- AUTO DETECT ----
+  // 1) search the whole frame for compact dark spots that are also MOVING (differ from a slow
+  //    running background) — this skips static trees and slow-drifting cloud texture;
+  // 2) a spot must reappear in about the same place for a few frames before it counts;
+  // 3) then it's handed to the same blob + velocity tracker as click-track, and
+  //    re-acquired automatically if lost.
+  let bgGray = null, bgDims = null, acq = [], acqT = -1;
   function autoDetect() {
-    const f = grabGray(); if (!f) return null;
+    if (trk) {
+      const r = trackStep();
+      if (r && !r.lost && trk.miss < 20) { updateBg(); return r; }
+      trk = null; template = null; acq = [];
+    }
+    if (vid.currentTime === acqT) return acq.lastOut || null;   // same video frame
+    acqT = vid.currentTime;
+    const f = grabGray(PROC_W); if (!f) return null;
     const { g, pw, ph } = f;
     if (!bgGray || bgDims !== pw*ph) { bgGray = Float32Array.from(g); bgDims = pw*ph; return null; }
-    // frame mean (sky brightness)
-    let mean = 0; for (let i=0;i<g.length;i++) mean += g[i]; mean /= g.length;
-    // difference map: how much each pixel differs from slow background, weighted toward darker-than-sky
-    // accumulate into a coarse grid of cells and score each cell
-    const CELL = 8;
-    const gw = Math.floor(pw/CELL), gh = Math.floor(ph/CELL);
-    const score = new Float32Array(gw*gh);
-    for (let y=0;y<gh*CELL;y++){
-      const row = y*pw; const gy = Math.floor(y/CELL)*gw;
-      for (let x=0;x<gw*CELL;x++){
-        const i = row + x;
-        const diff = Math.abs(g[i] - bgGray[i]);
-        const darker = Math.max(0, mean - g[i]); // drone usually darker than sky
-        if (diff > 14) score[gy + Math.floor(x/CELL)] += diff + darker*0.6;
-      }
+    const motion = (x, y) => {
+      let m = 0, n = 0;
+      for (let yy = Math.max(0, y-2); yy <= Math.min(ph-1, y+2); yy++)
+        for (let xx = Math.max(0, x-2); xx <= Math.min(pw-1, x+2); xx++) { m += Math.abs(g[yy*pw+xx] - bgGray[yy*pw+xx]); n++; }
+      return m / n;
+    };
+    const cands = findCandidates(f, pw/2, ph/2, Math.max(pw, ph), 6, 5)
+      .map(c => Object.assign(c, { m: motion(Math.round(c.cx), Math.round(c.cy)) }))
+      .filter(c => c.m > 6 && Math.max(c.w, c.h) < pw*0.15)
+      .map(c => Object.assign(c, { sc: c.peak * Math.min(3, c.m/10) * Math.exp(-c.gmin/120) * Math.exp(-Math.max(0, c.sat - 30)/20) }))
+      .sort((p, q) => q.sc - p.sc).slice(0, 8);
+    const next = [];
+    for (const c of cands) {
+      const hyp = acq.find(h => !h.used && Math.hypot(h.cx - c.cx, h.cy - c.cy) < 14);
+      if (hyp) hyp.used = true;
+      next.push({ cx: c.cx, cy: c.cy, w: c.w, h: c.h, sc: c.sc, hits: hyp ? hyp.hits + 1 : 1 });
     }
-    // update background slowly (so moving drone doesn't bleed in)
-    for (let i=0;i<g.length;i++) bgGray[i] += (g[i]-bgGray[i]) * 0.06;
-    // Bias the search toward where the drone was last frame, so it holds the lock
-    // instead of jumping to a cloud or a camera-shake flash elsewhere.
-    if (smooth) {
-      const lcx = (smooth.x + smooth.w/2) * gw, lcy = (smooth.y + smooth.h/2) * gh;
-      for (let cy=0; cy<gh; cy++) for (let cx=0; cx<gw; cx++) {
-        const d = Math.hypot(cx-lcx, cy-lcy);
-        score[cy*gw+cx] *= Math.exp(-(d*d)/(2*5*5)); // gaussian gate, ~5 cells wide
-      }
+    acq = next;
+    updateBg(g);
+    const ready = acq.filter(h => h.hits >= 4).sort((p, q) => q.sc - p.sc)[0];
+    if (ready) {
+      startTrack(ready.cx/pw, ready.cy/ph);
+      log("auto-lock at " + (ready.cx/pw).toFixed(2) + "," + (ready.cy/ph).toFixed(2), "lock");
+      return trackStep();
     }
-    // find best contiguous cluster: take peak cell, grow a small window around it
-    let peak = 0, pi = -1;
-    for (let i=0;i<score.length;i++) if (score[i] > peak) { peak = score[i]; pi = i; }
-    const FLOOR = CELL*CELL*10;
-    if (pi < 0 || peak < FLOOR) { autoMiss++; return holdLast(); } // nothing strong enough
-    const pcx = pi % gw, pcy = Math.floor(pi / gw);
-    // grow bbox over neighbouring active cells
-    let minx=pcx, maxx=pcx, miny=pcy, maxy=pcy;
-    const thr = peak*0.32;
-    for (let cy=Math.max(0,pcy-3);cy<=Math.min(gh-1,pcy+3);cy++)
-      for (let cx=Math.max(0,pcx-3);cx<=Math.min(gw-1,pcx+3);cx++)
-        if (score[cy*gw+cx] > thr){ minx=Math.min(minx,cx);maxx=Math.max(maxx,cx);miny=Math.min(miny,cy);maxy=Math.max(maxy,cy); }
-    // pad
-    const bx=(minx)*CELL, by=(miny)*CELL, bw=(maxx-minx+1)*CELL, bh=(maxy-miny+1)*CELL;
-    // reject regions that are too big (lighting/pan) or a thin full-width streak
-    const areaFrac = (bw*bh)/(pw*ph);
-    const ar = bw/bh;
-    if (areaFrac > 0.28 || ar > 6 || ar < 1/6) { autoMiss++; return holdLast(); }
-    autoMiss = 0;
-    const pad = 0.18;
-    let nb = { x:(bx-bw*pad)/pw, y:(by-bh*pad)/ph, w:(bw*(1+2*pad))/pw, h:(bh*(1+2*pad))/ph };
-    nb.x=Math.max(0,nb.x); nb.y=Math.max(0,nb.y);
-    // confidence from peak strength + compactness
-    const conf = Math.max(0, Math.min(0.98, 0.42 + Math.log10(peak/FLOOR)*0.4 + (1-areaFrac)*0.25));
-    // heavier smoothing kills jitter
-    if (!smooth) smooth = Object.assign({}, nb);
-    const a = 0.3, as = 0.2;
-    smooth.x+=(nb.x-smooth.x)*a; smooth.y+=(nb.y-smooth.y)*a;
-    smooth.w+=(nb.w-smooth.w)*as; smooth.h+=(nb.h-smooth.h)*as;
-    lastGood = Object.assign({}, smooth); lastConf = conf;
-    return { box: smooth, conf };
+    const cand = acq.filter(h => h.hits >= 2).sort((p, q) => q.sc - p.sc)[0];
+    acq.lastOut = cand ? { box: { x: (cand.cx - 9)/pw, y: (cand.cy - 9)/ph, w: 18/pw, h: 18/ph }, conf: 0.32 + 0.03*cand.hits } : null;
+    return acq.lastOut;
   }
-  // when a frame is uncertain, keep showing the last good box for a short while
-  let autoMiss = 0, lastGood = null;
-  function holdLast() {
-    if (lastGood && autoMiss < 12) return { box: lastGood, conf: Math.max(0.3, lastConf*0.9), held: true };
-    return null;
+  function updateBg(g) {
+    if (!g) { const f = grabGray(PROC_W); if (!f || !bgGray || bgDims !== f.pw*f.ph) return; g = f.g; }
+    for (let i = 0; i < g.length; i++) bgGray[i] += (g[i] - bgGray[i]) * 0.06;
   }
 
   // ---- sample auto-track lookup ----
@@ -467,16 +589,19 @@
       // user-clip manual template tracker (click fallback)
       const total = Math.round((vid.duration||0)*30)||"—";
       const cf = Math.round((vid.currentTime||0)*30);
-      if (template) {
+      if (trk) {
         const r = trackStep();
-        if (r) {
+        if (r && r.lost) {
+          setTelemetry(null,null,null,cf+" / "+total,"LOST");
+          chipSet("TARGET LOST · click the drone to re-lock");
+        } else if (r) {
           const conf = r.conf;
-          const state = conf>0.55 ? "LOCKED" : conf>0.3 ? "TRACKED" : "WEAK";
+          const state = conf>0.6 ? "LOCKED" : conf>0.35 ? "TRACKED" : "WEAK";
           const col = state==="LOCKED"?tok("--lock","#ffc24b"):state==="TRACKED"?tok("--grid","#17b8a6"):tok("--threat","#ff4d5e");
           drawBox(r.box, col, "drone "+(conf*100).toFixed(0)+"%");
           setTelemetry(r.box,"drone",conf,cf+" / "+total,state);
-          chipSet(state==="WEAK"?"TRACK WEAK · re-lock?":"TRACKING · NCC");
-          if (cf!==lastLog && cf%20===0){ log("ncc match "+(conf*100).toFixed(0)+"%", conf>0.55?"lock":""); lastLog=cf; }
+          chipSet(state==="WEAK"?"TRACK WEAK · click drone to re-lock":"TRACKING · blob + velocity");
+          if (cf!==lastLog && cf%20===0){ log("track "+(conf*100).toFixed(0)+"%", conf>0.6?"lock":""); lastLog=cf; }
         }
       } else {
         setTelemetry(null,null,null,cf+" / "+total,"NO TARGET");
@@ -497,14 +622,14 @@
     if (mode !== "track") return;
     const n = toNorm(e);
     if (n.x<0||n.x>1||n.y<0||n.y>1) { log("click on the frame, over the drone",""); return; }
-    extractTemplate(n.x, n.y, 0.04);  // default small box ~8% wide
+    const snapped = startTrack(n.x, n.y);   // snaps onto the drone nearest the click
     picking = false; promptEl.classList.remove("show");
     overlay.classList.remove("pick");
-    log("target locked at "+n.x.toFixed(2)+","+n.y.toFixed(2), "lock");
-    chipSet("TARGET LOCKED · press Run");
+    log((snapped ? "target locked at " : "no clear target · tracking click at ")+trk.cx.toFixed(2)+","+trk.cy.toFixed(2), snapped?"lock":"");
+    chipSet(running ? "RE-LOCKED" : "TARGET LOCKED · press Run");
     // draw immediately
     fitCanvasIfNeeded(); ctx.clearRect(0,0,overlay.width,overlay.height);
-    if (box) drawBox(box, tok("--lock","#ffc24b"), "drone locked");
+    drawBox(trackBox(), tok("--lock","#ffc24b"), "drone locked");
   });
 
   function enterPick() {
@@ -519,7 +644,7 @@
   const btnPlay = document.getElementById("btnPlay");
   const btnRelock = document.getElementById("btnRelock");
   btnPlay.addEventListener("click", () => {
-    if (mode === "track" && !template) { enterPick(); return; }
+    if (mode === "track" && !trk) { enterPick(); return; }
     if (vid.paused) {
       vid.play().then(()=>{ running=true; loop(); btnPlay.textContent="❚❚ Pause"; log("detection started",""); })
         .catch(()=>log("tap again to start",""));
@@ -530,13 +655,13 @@
   btnRelock.addEventListener("click", () => {
     if (usingSample) { log("switch applies to your uploaded clip",""); return; }
     if (mode === "auto") {
-      mode = "track"; template = null; smooth = null;
+      mode = "track"; template = null; trk = null; smooth = null;
       btnRelock.textContent = "⟳ Auto-detect";
       modetag.textContent = "YOUR CLIP · click-track";
       log("manual mode — click the drone","");
       enterPick();
     } else {
-      mode = "auto"; template = null; smooth = null; bgGray = null;
+      mode = "auto"; template = null; trk = null; smooth = null; bgGray = null; acq = [];
       btnRelock.textContent = "◎ Click-track";
       modetag.textContent = "YOUR CLIP · auto-detect";
       promptEl.classList.remove("show"); overlay.classList.remove("pick");
@@ -545,7 +670,7 @@
   });
   document.getElementById("file").addEventListener("change", (e) => {
     const f = e.target.files && e.target.files[0]; if (!f) return;
-    mode = "auto"; usingSample = false; template = null; smooth = null; bgGray = null; running = false;
+    mode = "auto"; usingSample = false; template = null; trk = null; smooth = null; bgGray = null; acq = []; running = false;
     vid.src = URL.createObjectURL(f);
     modetag.textContent = "YOUR CLIP · auto-detect";
     btnRelock.textContent = "◎ Click-track";
@@ -560,7 +685,7 @@
   });
 
   function loadSample() {
-    mode = "sample"; usingSample = true; template = null; smooth = null; picking = false;
+    mode = "sample"; usingSample = true; template = null; trk = null; smooth = null; picking = false;
     promptEl.classList.remove("show"); overlay.classList.remove("pick");
     modetag.textContent = "SAMPLE · auto-track";
     vid.src = SAMPLE_VIDEO; vid.currentTime = 0;
