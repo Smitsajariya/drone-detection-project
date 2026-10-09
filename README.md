@@ -17,10 +17,19 @@ A software-only system that detects drones in a video feed and reports where the
 
 Press **◆ AI mode** to run a drone-trained **YOLOv8n** network in the browser (ONNX + onnxruntime-web, WebGPU when available, otherwise WASM). It recognises a drone by its shape, so it works close up, indoors, against busy backgrounds and with a moving camera. It works on the sample, on uploaded clips and on the live camera.
 
-- **Models:** YOLOv8n from COCO weights, fine-tuned on the [drone-net](https://github.com/chuanenlin/drone-net) dataset (2,664 labelled drone images, one class) at 320 px on CPU.
-  - `models/drone-yolov8n.onnx` (*close-range / indoor*, default): early checkpoint, generalises better to small toy quadcopters. Validation mAP@50 0.93.
-  - `models/drone-yolov8n-sky.onnx` (*sky / outdoor*): 15 epochs, validation precision 0.95, recall 0.95, mAP@50 0.96, mAP@50-95 0.62. Best on DJI-type drones against the sky, but weaker on close-up toy drones.
-- **Real webcam test** (toy quadcopter, indoor, handheld, not used for training): with the close-range model at 480 px and 40% confidence, the drone was found in 15 of the 19 sampled frames where it is visible, with 0 false alarms in the 12 frames without a drone.
+- **Models:** YOLOv8n from COCO weights, fine-tuned on CPU at 320 px on the [drone-net](https://github.com/chuanenlin/drone-net) dataset (2,664 labelled drone images, one class).
+  - `models/drone-yolov8n.onnx` (*general*, default, threshold 25%): further fine-tuned with **hard negatives**, i.e. drone-free frames of the indoor and outdoor test locations (chairs, bikes, trees, windows, screens), so these are learned as background.
+  - `models/drone-yolov8n-sky.onnx` (*sky / outdoor*, threshold 40%): 15 epochs on drone-net only; best on DJI-type drones against the sky.
+- **Results** (480 px input; none of these frames were used for training):
+
+  | Test | old close-range model (40%) | general model (25%) |
+  |---|---|---|
+  | False alarms on held-out frames of the test locations | 33 / 49 | **0 / 49** |
+  | Handheld webcam clip: drone found | 15 / 19 | 10 / 19 |
+  | Handheld webcam clip: false alarms | 0 / 13 | 0 / 13 |
+  | drone-net validation mAP@50 | 0.93 | 0.96 |
+
+  Very close, handheld, motion-blurred views remain the hardest case; the target use (a drone flying 1–20 m from a fixed camera) matches the training data better.
 - **Tracking:** a detection must appear in 2 inference frames in a row before it locks. The box is then predicted forward between inference frames so it keeps up with a flying drone.
 - **Controls:** *Min confidence*; *Input* size (320 fast, 480 or 640 for small, distant drones); *Own model* loads any YOLOv8 `.onnx` file.
 

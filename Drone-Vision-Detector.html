@@ -159,8 +159,8 @@
   </div>
   <div class="livebar" id="aibar">
     <span id="aiStat">AI model: not loaded</span>
-    <label>Model <select id="aiModel"><option value="close" selected>close-range / indoor</option><option value="sky">sky / outdoor (DJI-type)</option></select></label>
-    <label>Min confidence <input type="range" id="aiConf" min="10" max="80" value="40"> <span id="aiConfV">40%</span></label>
+    <label>Model <select id="aiModel"><option value="close" selected>general (trained with test locations)</option><option value="sky">sky / outdoor (DJI-type)</option></select></label>
+    <label>Min confidence <input type="range" id="aiConf" min="10" max="80" value="25"> <span id="aiConfV">25%</span></label>
     <label>Input <select id="aiSize"><option value="320">320 fast</option><option value="480" selected>480 balanced</option><option value="640">640 tiny / very far</option></select></label>
     <label>Own model <input type="file" id="aiFile" accept=".onnx"></label>
   </div>
@@ -836,10 +836,10 @@
   const ORT_VER = "1.20.1";
   const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VER + "/dist/ort.webgpu.min.js";
   const MODEL_BASE = "https://cdn.jsdelivr.net/gh/Smitsajariya/drone-detection-project@main/models/";
-  const MODELS = { close: ["drone-yolov8n.onnx", "close-range"], sky: ["drone-yolov8n-sky.onnx", "sky"] };
+  const MODELS = { close: ["drone-yolov8n.onnx", "general", 25], sky: ["drone-yolov8n-sky.onnx", "sky", 40] };
   const MODEL_URL = MODEL_BASE + MODELS.close[0];
   const btnAI = document.getElementById("btnAI"), aibar = document.getElementById("aibar"), aiStat = document.getElementById("aiStat");
-  const ai = { on: false, sess: null, busy: false, loading: false, dets: [], n: 0, used: -1, trk: null, seen: 0, ms: 0, size: 480, thr: 0.40, nc: 1, locked: false };
+  const ai = { on: false, sess: null, busy: false, loading: false, dets: [], n: 0, used: -1, trk: null, seen: 0, ms: 0, size: 480, thr: 0.25, nc: 1, locked: false };
   const pre = document.createElement("canvas"), pctx = pre.getContext("2d", { willReadFrequently: true });
   function loadScript(u) { return new Promise((res, rej) => { const sc = document.createElement("script"); sc.src = u; sc.onload = res; sc.onerror = () => rej(new Error("could not load " + u)); document.head.appendChild(sc); }); }
   async function aiLoad(src, label) {
@@ -960,7 +960,9 @@
     if (ai.sess && !running && !live) chipSet("AI READY · press Run");
   });
   document.getElementById("aiModel").addEventListener("change", async e => {
-    const mm = MODELS[e.target.value]; ai.sess = null; await aiLoad(MODEL_BASE + mm[0], mm[1]);
+    const mm = MODELS[e.target.value]; ai.sess = null;
+    ai.thr = mm[2] / 100; document.getElementById("aiConf").value = mm[2]; document.getElementById("aiConfV").textContent = mm[2] + "%";
+    await aiLoad(MODEL_BASE + mm[0], mm[1]);
   });
   document.getElementById("aiConf").addEventListener("input", e => { ai.thr = e.target.value / 100; document.getElementById("aiConfV").textContent = e.target.value + "%"; });
   document.getElementById("aiSize").addEventListener("change", e => { ai.size = +e.target.value; ai.ms = 0; });
