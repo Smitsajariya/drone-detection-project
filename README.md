@@ -13,6 +13,16 @@ A software-only system that detects drones in a video feed and reports where the
 
 **Run:** download the repo and open either `.html` file in any modern browser. No install is needed.
 
+## AI mode (neural detector)
+
+Press **◆ AI mode** to run a drone-trained **YOLOv8n** network in the browser (ONNX + onnxruntime-web, WebGPU when available, otherwise WASM). It recognises a drone by its shape, so it works close up, indoors, against busy backgrounds and with a moving camera. It works on the sample, on uploaded clips and on the live camera.
+
+- **Model:** `models/drone-yolov8n.onnx`. YOLOv8n from COCO weights, fine-tuned on the [drone-net](https://github.com/chuanenlin/drone-net) dataset (2,664 labelled drone images, one class), at 320 px on CPU. Training is still in progress; this is an early checkpoint.
+- **Held-out validation (266 images):** precision 0.94, recall 0.91, mAP@50 0.93, mAP@50-95 0.53.
+- **Real webcam test** (toy quadcopter, indoor, handheld, not used for training): the drone was found in about 17 of the 19 sampled frames where it is visible. All false alarms were below 35% confidence, so the default threshold is 40%.
+- **Tracking:** a detection must appear in 2 inference frames in a row before it locks. The box is then predicted forward between inference frames so it keeps up with a flying drone.
+- **Controls:** *Min confidence*; *Input* size (320 fast, 480 or 640 for small, distant drones); *Own model* loads any YOLOv8 `.onnx` file.
+
 ## Live camera mode
 
 1. Open `Drone-Vision-Detector.html` in Chrome or Edge (or host it over https to use a phone) and press **● Live camera**, then allow camera access. Phones use the back camera.
@@ -24,13 +34,13 @@ A software-only system that detects drones in a video feed and reports where the
    - **Alert sound**, **Snapshot** (saves the frame with the box as a PNG), and a live fps readout.
 4. **Click-track** also works on the live feed: click the drone to lock the box by hand.
 
-Tested with a simulated camera feed (moving drone, drifting clouds, sensor noise): it locks in about 1 s and holds the box within about 4 px at 30 fps. The detector uses classic computer vision (motion + local contrast + velocity tracking), not a neural network, so it can't yet tell a drone from a bird. That's the next step in the roadmap.
+Tested with a simulated camera feed (moving drone, drifting clouds, sensor noise): it locks in about 1 s and holds the box within about 4 px at 30 fps. The detector uses classic computer vision (motion + local contrast + velocity tracking), not a neural network, so it can't tell a drone from a bird. AI mode covers that.
 
 Camera frames are processed locally in the browser and never uploaded.
 
 ## Roadmap
 
-1. ~~A detection engine that finds drones in a live camera or video stream~~ (done, classic CV); next, a drone-trained YOLO model to separate drones from birds.
+1. ~~A detection engine for a live camera or video stream~~ (done: classic CV + drone-trained YOLOv8n in the browser). Next: more epochs plus drone-vs-bird data (e.g. Drone-vs-Bird, Anti-UAV) for flying drones at distance.
 2. Multi-frame tracking so each drone keeps a stable identity as it moves.
 3. Performance measurement: precision, recall, mAP, frame rate, and the drone-vs-bird false-alarm rate.
 

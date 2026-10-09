@@ -159,8 +159,8 @@
   </div>
   <div class="livebar" id="aibar">
     <span id="aiStat">AI model: not loaded</span>
-    <label>Min confidence <input type="range" id="aiConf" min="10" max="80" value="35"> <span id="aiConfV">35%</span></label>
-    <label>Input <select id="aiSize"><option value="320">320 fast</option><option value="480" selected>480</option><option value="640">640 best</option></select></label>
+    <label>Min confidence <input type="range" id="aiConf" min="10" max="80" value="40"> <span id="aiConfV">40%</span></label>
+    <label>Input <select id="aiSize"><option value="320" selected>320 fast</option><option value="480">480 far drones</option><option value="640">640 tiny / very far</option></select></label>
     <label>Own model <input type="file" id="aiFile" accept=".onnx"></label>
   </div>
   <div class="livebar" id="livebar">
@@ -836,7 +836,7 @@
   const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VER + "/dist/ort.webgpu.min.js";
   const MODEL_URL = "https://cdn.jsdelivr.net/gh/Smitsajariya/drone-detection-project@main/models/drone-yolov8n.onnx";
   const btnAI = document.getElementById("btnAI"), aibar = document.getElementById("aibar"), aiStat = document.getElementById("aiStat");
-  const ai = { on: false, sess: null, busy: false, loading: false, dets: [], n: 0, used: -1, trk: null, seen: 0, ms: 0, size: 480, thr: 0.35, nc: 1, locked: false };
+  const ai = { on: false, sess: null, busy: false, loading: false, dets: [], n: 0, used: -1, trk: null, seen: 0, ms: 0, size: 320, thr: 0.40, nc: 1, locked: false };
   const pre = document.createElement("canvas"), pctx = pre.getContext("2d", { willReadFrequently: true });
   function loadScript(u) { return new Promise((res, rej) => { const sc = document.createElement("script"); sc.src = u; sc.onload = res; sc.onerror = () => rej(new Error("could not load " + u)); document.head.appendChild(sc); }); }
   async function aiLoad(src, label) {
@@ -904,25 +904,40 @@
     const now = performance.now();
     if (ai.used !== ai.n) {               // new inference result: update the smoothed track
       ai.used = ai.n;
-      const best = ai.dets[0];
+      // prefer the detection that continues the current track (a flying drone moves, so allow a wide gate)
+      let best = ai.dets[0];
+      if (ai.trk && ai.dets.length > 1) {
+        const pcx = ai.trk.x + ai.trk.w/2, pcy = ai.trk.y + ai.trk.h/2;
+        const near = ai.dets.filter(dd => Math.hypot(dd.x + dd.w/2 - pcx, dd.y + dd.h/2 - pcy) < Math.max(0.25, 3*ai.trk.w));
+        if (near.length) best = near.sort((a, b) => b.s - a.s)[0];
+      }
       if (best) {
-        if (ai.trk && iou(ai.trk, best) > 0.05) { for (const k of ["x","y","w","h"]) ai.trk[k] += (best[k] - ai.trk[k]) * 0.6; ai.trk.s = best.s; ai.trk.c = best.c; }
-        else ai.trk = Object.assign({}, best);
+        const dt = Math.max(30, now - ai.seen);
+        const close = ai.trk && (iou(ai.trk, best) > 0.02 || Math.hypot(best.x + best.w/2 - ai.trk.x - ai.trk.w/2, best.y + best.h/2 - ai.trk.y - ai.trk.h/2) < Math.max(0.25, 3*ai.trk.w));
+        if (close && now - ai.seen < 900) {
+          const ox = ai.trk.x, oy = ai.trk.y;
+          for (const k of ["x","y","w","h"]) ai.trk[k] += (best[k] - ai.trk[k]) * 0.7;
+          ai.trk.vx = 0.5*(ai.trk.vx||0) + 0.5*(ai.trk.x - ox)/dt; ai.trk.vy = 0.5*(ai.trk.vy||0) + 0.5*(ai.trk.y - oy)/dt;
+          ai.trk.s = ai.trk.s*0.4 + best.s*0.6; ai.trk.c = best.c; ai.trk.hits++;
+        } else ai.trk = Object.assign({ vx: 0, vy: 0, hits: 1 }, best);
         ai.seen = now;
       }
     }
-    for (const dd of ai.dets.slice(1)) drawBox(dd, tok("--grid", "#17b8a6"), aiName(dd.c) + " " + (dd.s*100).toFixed(0) + "%");
+    for (const dd of ai.dets) if (dd.s > 0.55 && !(ai.trk && iou(dd, ai.trk) > 0.3)) drawBox(dd, tok("--grid", "#17b8a6"), aiName(dd.c) + " " + (dd.s*100).toFixed(0) + "%");
     const fr = live ? liveFrame : Math.round((vid.currentTime||0)*30);
     const total = live ? "LIVE" : (Math.round((vid.duration||0)*30) || "—");
-    if (ai.trk && now - ai.seen < 700) {
+    if (ai.trk && now - ai.seen < 900 && (ai.trk.hits >= 2 || ai.trk.s > 0.65)) {   // 2 hits in a row = confirmed
       const state = ai.trk.s > 0.6 ? "LOCKED" : "TRACKED";
-      drawBox(ai.trk, state === "LOCKED" ? tok("--lock", "#ffc24b") : tok("--grid", "#17b8a6"), aiName(ai.trk.c) + " " + (ai.trk.s*100).toFixed(0) + "%");
-      setTelemetry(ai.trk, aiName(ai.trk.c), ai.trk.s, fr + " / " + total, state);
+      const lead = Math.min(250, now - ai.seen);                          // predict between AI frames
+      const shown = { x: ai.trk.x + ai.trk.vx*lead, y: ai.trk.y + ai.trk.vy*lead, w: ai.trk.w, h: ai.trk.h, s: ai.trk.s, c: ai.trk.c };
+      drawBox(shown, state === "LOCKED" ? tok("--lock", "#ffc24b") : tok("--grid", "#17b8a6"), aiName(ai.trk.c) + " " + (ai.trk.s*100).toFixed(0) + "%");
+      setTelemetry(shown, aiName(ai.trk.c), ai.trk.s, fr + " / " + total, state);
       chipSet("AI · YOLOv8 · " + ai.dets.length + " found · " + Math.round(ai.ms) + " ms");
       if (state === "LOCKED" && !ai.locked) alertLock();
       ai.locked = state === "LOCKED";
     } else {
-      ai.trk = null; ai.locked = false;
+      if (ai.trk && now - ai.seen >= 900) ai.trk = null;
+      ai.locked = false;
       setTelemetry(null, null, null, fr + " / " + total, "SEARCHING");
       chipSet("AI · scanning · " + Math.round(ai.ms) + " ms/frame");
     }
