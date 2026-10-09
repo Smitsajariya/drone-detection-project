@@ -835,7 +835,7 @@
   // ---- AI MODE: drone-trained YOLOv8 (ONNX) in the browser ----
   const ORT_VER = "1.20.1";
   const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VER + "/dist/ort.webgpu.min.js";
-  const MODEL_BASE = "https://cdn.jsdelivr.net/gh/Smitsajariya/drone-detection-project@main/models/";
+  const MODEL_BASE = "https://cdn.jsdelivr.net/gh/Smitsajariya/drone-detection-project@d73ae55774a9/models/";
   const MODELS = { close: ["drone-yolov8n.onnx", "general", 25], sky: ["drone-yolov8n-sky.onnx", "sky", 40] };
   const MODEL_URL = MODEL_BASE + MODELS.close[0];
   const btnAI = document.getElementById("btnAI"), aibar = document.getElementById("aibar"), aiStat = document.getElementById("aiStat");
