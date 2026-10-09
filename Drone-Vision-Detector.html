@@ -99,6 +99,13 @@
   .controls label.upload { position: relative; overflow: hidden; }
   .controls label.upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
 
+  .btn.live { border-color: var(--threat); color: var(--threat); }
+  .btn.live.on { background: var(--threat); color: var(--void); }
+  .livebar { display: none; gap: 10px 14px; flex-wrap: wrap; align-items: center; margin: -4px 0 14px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; font-family: var(--mono); font-size: 11px; color: var(--fg-dim); }
+  .livebar.show { display: flex; }
+  .livebar label { display: flex; align-items: center; gap: 6px; }
+  .livebar select, .livebar input[type=range] { font-family: var(--mono); font-size: 11px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--line); border-radius: 3px; padding: 4px; max-width: 190px; }
+  .livebar input[type=range] { width: 110px; padding: 0; accent-color: var(--grid); }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 620px) { .grid { grid-template-columns: 1fr; } }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 13px 14px; min-width: 0; }
@@ -144,6 +151,16 @@
     <label class="btn upload">↑ Upload clip<input type="file" id="file" accept="video/*"></label>
     <button class="btn" id="btnSample">Sample clip</button>
     <button class="btn" id="btnRelock" title="Switch auto-detect / click-track">◎ Click-track</button>
+    <button class="btn live" id="btnLive" title="Use your webcam / phone camera in real time">● Live camera</button>
+  </div>
+  <div class="livebar" id="livebar">
+    <label>Camera <select id="camSel"><option value="">default</option></select></label>
+    <label>Sensitivity <input type="range" id="sens" min="1" max="10" value="7"></label>
+    <label>Detail <select id="detail"><option value="1">fast</option><option value="1.5" selected>fine</option><option value="2">max</option></select></label>
+    <label>Target <select id="polar"><option value="dark">dark on sky (day)</option><option value="light">bright (night / LEDs)</option></select></label>
+    <label><input type="checkbox" id="beep"> alert sound</label>
+    <button class="btn" id="btnSnap" type="button">⤓ Snapshot</button>
+    <span id="fps">— fps</span>
   </div>
 
   <div class="grid">
@@ -170,7 +187,8 @@
     clicking. It works best on clear-sky clips; busy backgrounds or a drone that holds still can
     fool it, and it can't tell a drone from a bird. Switch to <b>Click-track</b> to lock the box by
     hand. For true neural detection (drone vs bird, any background) you need a drone-trained YOLOv8
-    run in Python — ask and I'll build that. Nothing you upload leaves your browser.
+    run in Python — ask and I'll build that. Nothing you upload leaves your browser.<br><br>
+    <b>Live camera.</b> Press <b>● Live camera</b> and allow camera access (phone: uses the back camera). Put the camera on a tripod or still surface pointed at the sky — auto-detect looks for small <i>moving</i> targets, so a shaking camera causes false alarms. Raise <b>Detail</b> for far-away drones, switch <b>Target</b> to <i>bright</i> at night, lower <b>Sensitivity</b> if birds/leaves trigger it. Camera frames are processed locally and never uploaded.
   </p>
 </div>
 
@@ -200,8 +218,8 @@
   // offscreen buffer we sample pixels from (downscaled for speed)
   const buf = document.createElement("canvas");
   const bctx = buf.getContext("2d", { willReadFrequently: true });
-  const PROC_W = 320;  // auto-detect processing width
-  const TRK_W = 480;   // click-track processing width (finer, so small drones keep their shape)
+  let PROC_W = 480;  // auto-detect processing width (changed by Detail)
+  let TRK_W = 640;   // click-track processing width (finer, so small drones keep their shape)
 
   document.getElementById("theme").addEventListener("click", () => {
     const r = document.documentElement, cur = r.getAttribute("data-theme");
@@ -230,6 +248,9 @@
   let box = null;              // current norm bbox {x,y,w,h}
   let smooth = null;
   let lastConf = 0;
+  let live = false, stream = null, invert = false, liveFrame = 0, sens = 7;
+  const fkey = () => live ? liveFrame : vid.currentTime;
+  const motionThr = () => live ? 15 - 1.3*sens : 6;   // sens 7 -> ~6
 
   function fitCanvasIfNeeded() {
     const r = overlay.getBoundingClientRect();
@@ -295,7 +316,7 @@
     const g = new Float32Array(pw * ph), sat = new Float32Array(pw * ph);
     const d = img.data;
     for (let i = 0, j = 0; i < d.length; i += 4, j++) {
-      g[j] = (d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114);
+      g[j] = (d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114); if (invert) g[j] = 255 - g[j];
       sat[j] = Math.max(d[i], d[i+1], d[i+2]) - Math.min(d[i], d[i+1], d[i+2]);   // colourfulness (blue sky is high)
     }
     return { g, sat, pw, ph };
@@ -455,10 +476,10 @@
   }
   function trackStep() {
     if (!trk) return null;
-    if (vid.currentTime === trk.lastT && trk.last) return trk.last;   // same video frame: nothing new
+    if (fkey() === trk.lastT && trk.last) return trk.last;   // same video frame: nothing new
     const f = grabGray(TRK_W); if (!f) return null;
     const { pw, ph } = f;
-    trk.lastT = vid.currentTime;
+    trk.lastT = fkey();
     const pcx = (trk.cx + trk.vx)*pw, pcy = (trk.cy + trk.vy)*ph;     // constant-velocity prediction
     const speed = Math.hypot(trk.vx*pw, trk.vy*ph);
     const R = Math.min(pw*0.15, (trk.size*2.5 + speed*2.5 + 14) * (1 + Math.min(trk.miss, 15)*0.12));
@@ -504,8 +525,8 @@
       if (r && !r.lost && trk.miss < 20) { updateBg(); return r; }
       trk = null; template = null; acq = [];
     }
-    if (vid.currentTime === acqT) return acq.lastOut || null;   // same video frame
-    acqT = vid.currentTime;
+    if (fkey() === acqT) return acq.lastOut || null;   // same video frame
+    acqT = fkey();
     const f = grabGray(PROC_W); if (!f) return null;
     const { g, pw, ph } = f;
     if (!bgGray || bgDims !== pw*ph) { bgGray = Float32Array.from(g); bgDims = pw*ph; return null; }
@@ -517,7 +538,7 @@
     };
     const cands = findCandidates(f, pw/2, ph/2, Math.max(pw, ph), 6, 5)
       .map(c => Object.assign(c, { m: motion(Math.round(c.cx), Math.round(c.cy)) }))
-      .filter(c => c.m > 6 && Math.max(c.w, c.h) < pw*0.15)
+      .filter(c => c.m > motionThr() && Math.max(c.w, c.h) < pw*0.15)
       .map(c => Object.assign(c, { sc: c.peak * Math.min(3, c.m/10) * Math.exp(-c.gmin/120) * Math.exp(-Math.max(0, c.sat - 30)/20) }))
       .sort((p, q) => q.sc - p.sc).slice(0, 8);
     const next = [];
@@ -528,7 +549,7 @@
     }
     acq = next;
     updateBg(g);
-    const ready = acq.filter(h => h.hits >= 4).sort((p, q) => q.sc - p.sc)[0];
+    const ready = acq.filter(h => h.hits >= (live ? 5 : 4)).sort((p, q) => q.sc - p.sc)[0];
     if (ready) {
       startTrack(ready.cx/pw, ready.cy/ph);
       log("auto-lock at " + (ready.cx/pw).toFixed(2) + "," + (ready.cy/ph).toFixed(2), "lock");
@@ -551,12 +572,17 @@
   }
 
   // ---- main loop ----
-  let lastLog = -1;
+  let lastLog = -1, fpsN = 0, fpsT = performance.now(), wasLocked = false;
   function loop() {
     if (!running) return;
     fitCanvasIfNeeded();
     ctx.clearRect(0,0,overlay.width,overlay.height);
 
+    if (live) {
+      liveFrame = vid.requestVideoFrameCallback ? liveFrame : liveFrame + 1;
+      const now = performance.now();
+      if (now - fpsT > 1000) { document.getElementById("fps").textContent = Math.round((liveFrame-fpsN)*1000/(now-fpsT)) + " fps · " + vid.videoWidth + "×" + vid.videoHeight; fpsN = liveFrame; fpsT = now; }
+    }
     if (mode === "sample") {
       const total = SAMPLE_TRACK.length;
       const cf = Math.round(vid.currentTime*SAMPLE_FPS);
@@ -570,9 +596,12 @@
       if (cf!==lastLog && cf%25===0){ log(state==="LOCKED"?"lock · range closing":"drone "+(sb.score*100).toFixed(0)+"%", state==="LOCKED"?"lock":""); lastLog=cf; }
     } else if (mode === "auto") {
       // fully automatic: motion + dark-blob detection, no click needed
-      const total = Math.round((vid.duration||0)*30)||"—";
-      const cf = Math.round((vid.currentTime||0)*30);
+      const total = live ? "LIVE" : (Math.round((vid.duration||0)*30)||"—");
+      const cf = live ? liveFrame : Math.round((vid.currentTime||0)*30);
       const r = autoDetect();
+      const lockedNow = !!(r && r.conf > 0.7);
+      if (lockedNow && !wasLocked) alertLock();
+      wasLocked = lockedNow;
       if (r && r.conf > 0.3) {
         const conf = r.conf;
         const state = conf>0.7 ? "LOCKED" : "TRACKED";
@@ -587,8 +616,8 @@
       }
     } else {
       // user-clip manual template tracker (click fallback)
-      const total = Math.round((vid.duration||0)*30)||"—";
-      const cf = Math.round((vid.currentTime||0)*30);
+      const total = live ? "LIVE" : (Math.round((vid.duration||0)*30)||"—");
+      const cf = live ? liveFrame : Math.round((vid.currentTime||0)*30);
       if (trk) {
         const r = trackStep();
         if (r && r.lost) {
@@ -670,6 +699,7 @@
   });
   document.getElementById("file").addEventListener("change", (e) => {
     const f = e.target.files && e.target.files[0]; if (!f) return;
+    stopLive();
     mode = "auto"; usingSample = false; template = null; trk = null; smooth = null; bgGray = null; acq = []; running = false;
     vid.src = URL.createObjectURL(f);
     modetag.textContent = "YOUR CLIP · auto-detect";
@@ -685,6 +715,7 @@
   });
 
   function loadSample() {
+    stopLive();
     mode = "sample"; usingSample = true; template = null; trk = null; smooth = null; picking = false;
     promptEl.classList.remove("show"); overlay.classList.remove("pick");
     modetag.textContent = "SAMPLE · auto-track";
@@ -692,6 +723,98 @@
     log("sample clip loaded","");
     chipSet("READY — press Run");
   }
+
+  // ---- LIVE CAMERA ----
+  const btnLive = document.getElementById("btnLive"), livebar = document.getElementById("livebar");
+  const camSel = document.getElementById("camSel");
+  function resetDetector() { template = null; trk = null; smooth = null; bgGray = null; acq = []; acqT = -1; wasLocked = false; }
+  function countFrames() {   // exact new-frame counter where the browser supports it
+    if (!live || !vid.requestVideoFrameCallback) return;
+    vid.requestVideoFrameCallback(() => { liveFrame++; countFrames(); });
+  }
+  async function listCams() {
+    try {
+      const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+      const cur = stream && stream.getVideoTracks()[0] && stream.getVideoTracks()[0].getSettings().deviceId;
+      camSel.innerHTML = "";
+      devs.forEach((d, i) => { const o = document.createElement("option"); o.value = d.deviceId; o.textContent = d.label || ("camera " + (i+1)); if (d.deviceId === cur) o.selected = true; camSel.appendChild(o); });
+    } catch (_) {}
+  }
+  async function startLive(deviceId) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      log("camera not available — open this page over https or as a local file in Chrome/Edge", ""); chipSet("NO CAMERA API"); return;
+    }
+    const video = deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: "environment" } };
+    Object.assign(video, { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } });
+    try {
+      const s2 = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      stream = s2;
+    } catch (err) {
+      log("camera blocked: " + (err.name || err) + " — allow camera access in the browser", "");
+      chipSet("CAMERA PERMISSION NEEDED"); return;
+    }
+    live = true; usingSample = false; mode = "auto"; resetDetector(); liveFrame = 0;
+    vid.pause(); vid.removeAttribute("src"); vid.loop = false; vid.srcObject = stream;
+    btnLive.classList.add("on"); btnLive.textContent = "■ Stop camera";
+    livebar.classList.add("show");
+    btnRelock.textContent = "◎ Click-track";
+    modetag.textContent = "LIVE CAMERA · auto-detect";
+    promptEl.classList.remove("show"); overlay.classList.remove("pick");
+    await vid.play().catch(() => {});
+    const wasRunning = running; running = true; btnPlay.textContent = "❚❚ Pause"; countFrames(); if (!wasRunning) loop();
+    const st = stream.getVideoTracks()[0].getSettings();
+    log("live camera on · " + (st.width||"?") + "×" + (st.height||"?") + " — hold camera still", "ok");
+    chipSet("LIVE · scanning sky");
+    listCams();
+  }
+  function stopLive() {
+    if (!live) return;
+    live = false; running = false;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null; vid.srcObject = null; vid.loop = true;
+    btnLive.classList.remove("on"); btnLive.textContent = "● Live camera";
+    livebar.classList.remove("show"); btnPlay.textContent = "▶ Run detection";
+    document.getElementById("fps").textContent = "— fps";
+    log("camera stopped", "");
+  }
+  btnLive.addEventListener("click", () => { if (live) { stopLive(); loadSample(); } else startLive(); });
+  camSel.addEventListener("change", () => { if (live && camSel.value) startLive(camSel.value); });
+  document.getElementById("sens").addEventListener("input", e => { sens = +e.target.value; });
+  document.getElementById("detail").addEventListener("change", e => {
+    const k = +e.target.value; PROC_W = Math.round(320*k); TRK_W = Math.round(480*k); resetDetector();
+    log("detail " + PROC_W + "px — re-scanning", "");
+  });
+  document.getElementById("polar").addEventListener("change", e => {
+    invert = e.target.value === "light"; resetDetector();
+    log(invert ? "looking for bright targets (night / LEDs)" : "looking for dark targets on sky", "");
+  });
+  // short two-tone beep on a new lock
+  let actx = null;
+  function alertLock() {
+    log("DRONE LOCKED", "lock");
+    if (!document.getElementById("beep").checked) return;
+    try {
+      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      [880, 1320].forEach((fq, i) => {
+        const o = actx.createOscillator(), g = actx.createGain(), t0 = actx.currentTime + i*0.14;
+        o.frequency.value = fq; g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.25, t0 + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12); o.connect(g).connect(actx.destination); o.start(t0); o.stop(t0 + 0.13);
+      });
+    } catch (_) {}
+  }
+  // save current frame + detection box as PNG
+  document.getElementById("btnSnap").addEventListener("click", () => {
+    const vw = vid.videoWidth, vh = vid.videoHeight; if (!vw) return;
+    const c = document.createElement("canvas"); c.width = vw; c.height = vh;
+    const x = c.getContext("2d"); x.drawImage(vid, 0, 0, vw, vh);
+    const { ox, oy, dw, dh } = videoRectInCanvas();
+    x.drawImage(overlay, ox, oy, dw, dh, 0, 0, vw, vh);
+    x.font = Math.round(vh/40) + "px monospace"; x.fillStyle = "#17b8a6";
+    x.fillText("DRONE VISION · " + new Date().toISOString().replace("T"," ").slice(0,19) + " · " + el.track.textContent + " " + el.conf.textContent, 12, vh - 14);
+    const a = document.createElement("a"); a.download = "drone-snapshot-" + Date.now() + ".png"; a.href = c.toDataURL("image/png"); a.click();
+    log("snapshot saved", "ok");
+  });
 
   // ---- boot ----
   loadSample();
