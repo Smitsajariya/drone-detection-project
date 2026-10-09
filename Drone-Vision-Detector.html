@@ -693,7 +693,7 @@
     if (vid.paused) {
       vid.play().then(()=>{ running=true; loop(); btnPlay.textContent="❚❚ Pause"; log("detection started",""); })
         .catch(()=>log("tap again to start",""));
-    } else { vid.pause(); running=false; btnPlay.textContent="▶ Run detection"; }
+    } else { vid.pause(); running=false; btnPlay.textContent="▶ Run detection"; ctx.clearRect(0,0,overlay.width,overlay.height); ai.trk=null; setTelemetry(null,null,null,"—","PAUSED"); chipSet("PAUSED"); }
   });
   document.getElementById("btnSample").addEventListener("click", loadSample);
   // toggle between auto-detect and click-to-track (only for uploaded clips)
@@ -912,7 +912,10 @@
       if (ai.trk && ai.dets.length > 1) {
         const pcx = ai.trk.x + ai.trk.w/2, pcy = ai.trk.y + ai.trk.h/2;
         const near = ai.dets.filter(dd => Math.hypot(dd.x + dd.w/2 - pcx, dd.y + dd.h/2 - pcy) < Math.max(0.25, 3*ai.trk.w));
-        if (near.length) best = near.sort((a, b) => b.s - a.s)[0];
+        const nb = near.sort((a, b) => b.s - a.s)[0];
+        // keep following the current target only if it is still about as strong as the best detection;
+        // otherwise jump to the stronger one (avoids staying stuck on a chair/window after a false lock)
+        if (nb && nb.s >= ai.dets[0].s - 0.1) best = nb;
       }
       if (best) {
         const dt = Math.max(30, now - ai.seen);
