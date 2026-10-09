@@ -106,6 +106,9 @@
   .livebar label { display: flex; align-items: center; gap: 6px; }
   .livebar select, .livebar input[type=range] { font-family: var(--mono); font-size: 11px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--line); border-radius: 3px; padding: 4px; max-width: 190px; }
   .livebar input[type=range] { width: 110px; padding: 0; accent-color: var(--grid); }
+  .btn.ai { border-color: var(--lock); color: var(--lock); }
+  .btn.ai.on { background: var(--lock); color: var(--void); }
+  .livebar input[type=file] { font-family: var(--mono); font-size: 10.5px; color: var(--fg-dim); max-width: 210px; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 620px) { .grid { grid-template-columns: 1fr; } }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 13px 14px; min-width: 0; }
@@ -151,7 +154,14 @@
     <label class="btn upload">↑ Upload clip<input type="file" id="file" accept="video/*"></label>
     <button class="btn" id="btnSample">Sample clip</button>
     <button class="btn" id="btnRelock" title="Switch auto-detect / click-track">◎ Click-track</button>
+    <button class="btn ai" id="btnAI" title="Neural drone detector (YOLOv8, runs in your browser)">◆ AI mode</button>
     <button class="btn live" id="btnLive" title="Use your webcam / phone camera in real time">● Live camera</button>
+  </div>
+  <div class="livebar" id="aibar">
+    <span id="aiStat">AI model: not loaded</span>
+    <label>Min confidence <input type="range" id="aiConf" min="10" max="80" value="35"> <span id="aiConfV">35%</span></label>
+    <label>Input <select id="aiSize"><option value="320">320 fast</option><option value="480" selected>480</option><option value="640">640 best</option></select></label>
+    <label>Own model <input type="file" id="aiFile" accept=".onnx"></label>
   </div>
   <div class="livebar" id="livebar">
     <label>Camera <select id="camSel"><option value="">default</option></select></label>
@@ -188,6 +198,10 @@
     fool it, and it can't tell a drone from a bird. Switch to <b>Click-track</b> to lock the box by
     hand. For true neural detection (drone vs bird, any background) you need a drone-trained YOLOv8
     run in Python — ask and I'll build that. Nothing you upload leaves your browser.<br><br>
+    <b>AI mode.</b> Press <b>◆ AI mode</b> to switch from motion detection to a drone-trained YOLOv8 neural network
+    (ONNX, runs locally in your browser via onnxruntime-web; the model downloads once). It recognises the drone by its
+    shape, so it also works close-up, indoors, against busy backgrounds and with a moving camera. Works on the sample,
+    uploaded clips and the live camera.<br><br>
     <b>Live camera.</b> Press <b>● Live camera</b> and allow camera access (phone: uses the back camera). Put the camera on a tripod or still surface pointed at the sky — auto-detect looks for small <i>moving</i> targets, so a shaking camera causes false alarms. Raise <b>Detail</b> for far-away drones, switch <b>Target</b> to <i>bright</i> at night, lower <b>Sensitivity</b> if birds/leaves trigger it. Camera frames are processed locally and never uploaded.
   </p>
 </div>
@@ -583,6 +597,7 @@
       const now = performance.now();
       if (now - fpsT > 1000) { document.getElementById("fps").textContent = Math.round((liveFrame-fpsN)*1000/(now-fpsT)) + " fps · " + vid.videoWidth + "×" + vid.videoHeight; fpsN = liveFrame; fpsT = now; }
     }
+    if (ai.on && ai.sess) { aiRun(); aiDraw(); requestAnimationFrame(loop); return; }
     if (mode === "sample") {
       const total = SAMPLE_TRACK.length;
       const cf = Math.round(vid.currentTime*SAMPLE_FPS);
@@ -814,6 +829,118 @@
     x.fillText("DRONE VISION · " + new Date().toISOString().replace("T"," ").slice(0,19) + " · " + el.track.textContent + " " + el.conf.textContent, 12, vh - 14);
     const a = document.createElement("a"); a.download = "drone-snapshot-" + Date.now() + ".png"; a.href = c.toDataURL("image/png"); a.click();
     log("snapshot saved", "ok");
+  });
+
+  // ---- AI MODE: drone-trained YOLOv8 (ONNX) in the browser ----
+  const ORT_VER = "1.20.1";
+  const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VER + "/dist/ort.webgpu.min.js";
+  const MODEL_URL = "https://cdn.jsdelivr.net/gh/Smitsajariya/drone-detection-project@main/models/drone-yolov8n.onnx";
+  const btnAI = document.getElementById("btnAI"), aibar = document.getElementById("aibar"), aiStat = document.getElementById("aiStat");
+  const ai = { on: false, sess: null, busy: false, loading: false, dets: [], n: 0, used: -1, trk: null, seen: 0, ms: 0, size: 480, thr: 0.35, nc: 1, locked: false };
+  const pre = document.createElement("canvas"), pctx = pre.getContext("2d", { willReadFrequently: true });
+  function loadScript(u) { return new Promise((res, rej) => { const sc = document.createElement("script"); sc.src = u; sc.onload = res; sc.onerror = () => rej(new Error("could not load " + u)); document.head.appendChild(sc); }); }
+  async function aiLoad(src, label) {
+    ai.loading = true; aiStat.textContent = "AI model: loading…"; chipSet("AI · loading model");
+    try {
+      if (!window.ort) {
+        await loadScript(ORT_URL);
+        ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VER + "/dist/";
+        ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+      }
+      let buf = src;
+      if (typeof src === "string") { const r = await fetch(src); if (!r.ok) throw new Error("model download failed (HTTP " + r.status + ")"); buf = await r.arrayBuffer(); }
+      const bytes = new Uint8Array(buf);
+      ai.ep = "wasm";
+      if (navigator.gpu) {   // GPU when available (much faster), CPU/WASM otherwise
+        try { ai.sess = await ort.InferenceSession.create(bytes, { executionProviders: ["webgpu"] }); ai.ep = "webgpu"; } catch (_) { ai.sess = null; }
+      }
+      if (!ai.sess) ai.sess = await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"], graphOptimizationLevel: "all" });
+      ai.dets = []; ai.trk = null; ai.n = 0; ai.used = -1;
+      aiStat.textContent = "AI model: " + label + " ✓ (" + ai.ep + ")";
+      log("AI model ready · " + label, "ok");
+    } catch (e) {
+      ai.sess = null; aiStat.textContent = "AI model: failed — " + e.message;
+      log("AI model failed: " + e.message + " · use 'Own model'", "");
+    }
+    ai.loading = false;
+  }
+  function iou(a, b) {
+    const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y), x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+    const i = Math.max(0, x2 - x1) * Math.max(0, y2 - y1); return i / (a.w*a.h + b.w*b.h - i + 1e-9);
+  }
+  async function aiRun() {
+    if (!ai.sess || ai.busy || !vid.videoWidth || vid.readyState < 2) return;
+    ai.busy = true;
+    try {
+      const S = ai.size, vw = vid.videoWidth, vh = vid.videoHeight;
+      const sc = Math.min(S / vw, S / vh), nw = Math.round(vw * sc), nh = Math.round(vh * sc);
+      const px = Math.floor((S - nw) / 2), py = Math.floor((S - nh) / 2);
+      if (pre.width !== S) { pre.width = S; pre.height = S; }
+      pctx.fillStyle = "rgb(114,114,114)"; pctx.fillRect(0, 0, S, S); pctx.drawImage(vid, px, py, nw, nh);   // letterbox
+      const d = pctx.getImageData(0, 0, S, S).data, A = S * S, t = new Float32Array(3 * A);
+      for (let i = 0, j = 0; j < A; i += 4, j++) { t[j] = d[i] / 255; t[j + A] = d[i + 1] / 255; t[j + 2*A] = d[i + 2] / 255; }
+      const t0 = performance.now();
+      const out = await ai.sess.run({ [ai.sess.inputNames[0]]: new ort.Tensor("float32", t, [1, 3, S, S]) });
+      ai.ms = ai.ms ? ai.ms * 0.8 + (performance.now() - t0) * 0.2 : performance.now() - t0;
+      const o = out[ai.sess.outputNames[0]], C = o.dims[1], N = o.dims[2], od = o.data, nc = C - 4;
+      ai.nc = nc;
+      const cand = [];
+      for (let k = 0; k < N; k++) {
+        let best = 0, bc = 0;
+        for (let c = 0; c < nc; c++) { const v = od[(4 + c)*N + k]; if (v > best) { best = v; bc = c; } }
+        if (best < ai.thr) continue;
+        const cx = od[k], cy = od[N + k], w = od[2*N + k], h = od[3*N + k];
+        cand.push({ x: (cx - w/2 - px) / sc / vw, y: (cy - h/2 - py) / sc / vh, w: w / sc / vw, h: h / sc / vh, s: best, c: bc });
+      }
+      cand.sort((a, b) => b.s - a.s);
+      const keep = [];
+      for (const b of cand) { if (keep.every(k => iou(k, b) < 0.45)) keep.push(b); if (keep.length >= 10) break; }
+      ai.dets = keep; ai.n++;
+    } catch (e) { log("AI error: " + e.message, ""); ai.on = false; btnAI.classList.remove("on"); }
+    ai.busy = false;
+  }
+  const aiName = c => ai.nc === 1 ? "drone" : (ai.nc === 80 && c === 0 ? "person" : "class " + c);
+  function aiDraw() {
+    const now = performance.now();
+    if (ai.used !== ai.n) {               // new inference result: update the smoothed track
+      ai.used = ai.n;
+      const best = ai.dets[0];
+      if (best) {
+        if (ai.trk && iou(ai.trk, best) > 0.05) { for (const k of ["x","y","w","h"]) ai.trk[k] += (best[k] - ai.trk[k]) * 0.6; ai.trk.s = best.s; ai.trk.c = best.c; }
+        else ai.trk = Object.assign({}, best);
+        ai.seen = now;
+      }
+    }
+    for (const dd of ai.dets.slice(1)) drawBox(dd, tok("--grid", "#17b8a6"), aiName(dd.c) + " " + (dd.s*100).toFixed(0) + "%");
+    const fr = live ? liveFrame : Math.round((vid.currentTime||0)*30);
+    const total = live ? "LIVE" : (Math.round((vid.duration||0)*30) || "—");
+    if (ai.trk && now - ai.seen < 700) {
+      const state = ai.trk.s > 0.6 ? "LOCKED" : "TRACKED";
+      drawBox(ai.trk, state === "LOCKED" ? tok("--lock", "#ffc24b") : tok("--grid", "#17b8a6"), aiName(ai.trk.c) + " " + (ai.trk.s*100).toFixed(0) + "%");
+      setTelemetry(ai.trk, aiName(ai.trk.c), ai.trk.s, fr + " / " + total, state);
+      chipSet("AI · YOLOv8 · " + ai.dets.length + " found · " + Math.round(ai.ms) + " ms");
+      if (state === "LOCKED" && !ai.locked) alertLock();
+      ai.locked = state === "LOCKED";
+    } else {
+      ai.trk = null; ai.locked = false;
+      setTelemetry(null, null, null, fr + " / " + total, "SEARCHING");
+      chipSet("AI · scanning · " + Math.round(ai.ms) + " ms/frame");
+    }
+  }
+  btnAI.addEventListener("click", async () => {
+    ai.on = !ai.on;
+    btnAI.classList.toggle("on", ai.on); aibar.classList.toggle("show", ai.on);
+    btnAI.textContent = ai.on ? "◆ AI on" : "◆ AI mode";
+    if (!ai.on) { resetDetector(); log("AI off · back to motion detector", ""); return; }
+    log("AI mode on", "lock");
+    if (!ai.sess && !ai.loading) await aiLoad(MODEL_URL, "drone-yolov8n");
+    if (ai.sess && !running && !live) chipSet("AI READY · press Run");
+  });
+  document.getElementById("aiConf").addEventListener("input", e => { ai.thr = e.target.value / 100; document.getElementById("aiConfV").textContent = e.target.value + "%"; });
+  document.getElementById("aiSize").addEventListener("change", e => { ai.size = +e.target.value; ai.ms = 0; });
+  document.getElementById("aiFile").addEventListener("change", async e => {
+    const f = e.target.files && e.target.files[0]; if (!f) return;
+    await aiLoad(await f.arrayBuffer(), f.name);
   });
 
   // ---- boot ----
