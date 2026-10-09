@@ -17,9 +17,10 @@ A software-only system that detects drones in a video feed and reports where the
 
 Press **◆ AI mode** to run a drone-trained **YOLOv8n** network in the browser (ONNX + onnxruntime-web, WebGPU when available, otherwise WASM). It recognises a drone by its shape, so it works close up, indoors, against busy backgrounds and with a moving camera. It works on the sample, on uploaded clips and on the live camera.
 
-- **Model:** `models/drone-yolov8n.onnx`. YOLOv8n from COCO weights, fine-tuned on the [drone-net](https://github.com/chuanenlin/drone-net) dataset (2,664 labelled drone images, one class), at 320 px on CPU. Training is still in progress; this is an early checkpoint.
-- **Held-out validation (266 images):** precision 0.94, recall 0.91, mAP@50 0.93, mAP@50-95 0.53.
-- **Real webcam test** (toy quadcopter, indoor, handheld, not used for training): the drone was found in about 17 of the 19 sampled frames where it is visible. All false alarms were below 35% confidence, so the default threshold is 40%.
+- **Models:** YOLOv8n from COCO weights, fine-tuned on the [drone-net](https://github.com/chuanenlin/drone-net) dataset (2,664 labelled drone images, one class) at 320 px on CPU.
+  - `models/drone-yolov8n.onnx` (*close-range / indoor*, default): early checkpoint, generalises better to small toy quadcopters. Validation mAP@50 0.93.
+  - `models/drone-yolov8n-sky.onnx` (*sky / outdoor*): 15 epochs, validation precision 0.95, recall 0.95, mAP@50 0.96, mAP@50-95 0.62. Best on DJI-type drones against the sky, but weaker on close-up toy drones.
+- **Real webcam test** (toy quadcopter, indoor, handheld, not used for training): with the close-range model at 480 px and 40% confidence, the drone was found in 15 of the 19 sampled frames where it is visible, with 0 false alarms in the 12 frames without a drone.
 - **Tracking:** a detection must appear in 2 inference frames in a row before it locks. The box is then predicted forward between inference frames so it keeps up with a flying drone.
 - **Controls:** *Min confidence*; *Input* size (320 fast, 480 or 640 for small, distant drones); *Own model* loads any YOLOv8 `.onnx` file.
 

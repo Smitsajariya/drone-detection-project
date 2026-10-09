@@ -159,8 +159,9 @@
   </div>
   <div class="livebar" id="aibar">
     <span id="aiStat">AI model: not loaded</span>
+    <label>Model <select id="aiModel"><option value="close" selected>close-range / indoor</option><option value="sky">sky / outdoor (DJI-type)</option></select></label>
     <label>Min confidence <input type="range" id="aiConf" min="10" max="80" value="40"> <span id="aiConfV">40%</span></label>
-    <label>Input <select id="aiSize"><option value="320" selected>320 fast</option><option value="480">480 far drones</option><option value="640">640 tiny / very far</option></select></label>
+    <label>Input <select id="aiSize"><option value="320">320 fast</option><option value="480" selected>480 balanced</option><option value="640">640 tiny / very far</option></select></label>
     <label>Own model <input type="file" id="aiFile" accept=".onnx"></label>
   </div>
   <div class="livebar" id="livebar">
@@ -834,9 +835,11 @@
   // ---- AI MODE: drone-trained YOLOv8 (ONNX) in the browser ----
   const ORT_VER = "1.20.1";
   const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VER + "/dist/ort.webgpu.min.js";
-  const MODEL_URL = "https://cdn.jsdelivr.net/gh/Smitsajariya/drone-detection-project@main/models/drone-yolov8n.onnx";
+  const MODEL_BASE = "https://cdn.jsdelivr.net/gh/Smitsajariya/drone-detection-project@main/models/";
+  const MODELS = { close: ["drone-yolov8n.onnx", "close-range"], sky: ["drone-yolov8n-sky.onnx", "sky"] };
+  const MODEL_URL = MODEL_BASE + MODELS.close[0];
   const btnAI = document.getElementById("btnAI"), aibar = document.getElementById("aibar"), aiStat = document.getElementById("aiStat");
-  const ai = { on: false, sess: null, busy: false, loading: false, dets: [], n: 0, used: -1, trk: null, seen: 0, ms: 0, size: 320, thr: 0.40, nc: 1, locked: false };
+  const ai = { on: false, sess: null, busy: false, loading: false, dets: [], n: 0, used: -1, trk: null, seen: 0, ms: 0, size: 480, thr: 0.40, nc: 1, locked: false };
   const pre = document.createElement("canvas"), pctx = pre.getContext("2d", { willReadFrequently: true });
   function loadScript(u) { return new Promise((res, rej) => { const sc = document.createElement("script"); sc.src = u; sc.onload = res; sc.onerror = () => rej(new Error("could not load " + u)); document.head.appendChild(sc); }); }
   async function aiLoad(src, label) {
@@ -926,17 +929,19 @@
     for (const dd of ai.dets) if (dd.s > 0.55 && !(ai.trk && iou(dd, ai.trk) > 0.3)) drawBox(dd, tok("--grid", "#17b8a6"), aiName(dd.c) + " " + (dd.s*100).toFixed(0) + "%");
     const fr = live ? liveFrame : Math.round((vid.currentTime||0)*30);
     const total = live ? "LIVE" : (Math.round((vid.duration||0)*30) || "—");
-    if (ai.trk && now - ai.seen < 900 && (ai.trk.hits >= 2 || ai.trk.s > 0.65)) {   // 2 hits in a row = confirmed
+    if (ai.trk && now - ai.seen < Math.max(600, 1.5*ai.ms) && (ai.trk.hits >= 2 || ai.trk.s > 0.65)) {   // 2 hits in a row = confirmed
       const state = ai.trk.s > 0.6 ? "LOCKED" : "TRACKED";
       const lead = Math.min(250, now - ai.seen);                          // predict between AI frames
-      const shown = { x: ai.trk.x + ai.trk.vx*lead, y: ai.trk.y + ai.trk.vy*lead, w: ai.trk.w, h: ai.trk.h, s: ai.trk.s, c: ai.trk.c };
+      const cap = (v, m) => Math.max(-m, Math.min(m, v));
+      const shown = { x: ai.trk.x + cap(ai.trk.vx*lead, 0.5*ai.trk.w), y: ai.trk.y + cap(ai.trk.vy*lead, 0.5*ai.trk.h), w: ai.trk.w, h: ai.trk.h, s: ai.trk.s, c: ai.trk.c };
+      shown.x = Math.max(-shown.w*0.3, Math.min(1 - shown.w*0.7, shown.x)); shown.y = Math.max(-shown.h*0.3, Math.min(1 - shown.h*0.7, shown.y));
       drawBox(shown, state === "LOCKED" ? tok("--lock", "#ffc24b") : tok("--grid", "#17b8a6"), aiName(ai.trk.c) + " " + (ai.trk.s*100).toFixed(0) + "%");
       setTelemetry(shown, aiName(ai.trk.c), ai.trk.s, fr + " / " + total, state);
       chipSet("AI · YOLOv8 · " + ai.dets.length + " found · " + Math.round(ai.ms) + " ms");
       if (state === "LOCKED" && !ai.locked) alertLock();
       ai.locked = state === "LOCKED";
     } else {
-      if (ai.trk && now - ai.seen >= 900) ai.trk = null;
+      if (ai.trk && now - ai.seen >= Math.max(600, 1.5*ai.ms)) ai.trk = null;
       ai.locked = false;
       setTelemetry(null, null, null, fr + " / " + total, "SEARCHING");
       chipSet("AI · scanning · " + Math.round(ai.ms) + " ms/frame");
@@ -948,8 +953,11 @@
     btnAI.textContent = ai.on ? "◆ AI on" : "◆ AI mode";
     if (!ai.on) { resetDetector(); log("AI off · back to motion detector", ""); return; }
     log("AI mode on", "lock");
-    if (!ai.sess && !ai.loading) await aiLoad(MODEL_URL, "drone-yolov8n");
+    if (!ai.sess && !ai.loading) { const mm = MODELS[document.getElementById("aiModel").value]; await aiLoad(MODEL_BASE + mm[0], mm[1]); }
     if (ai.sess && !running && !live) chipSet("AI READY · press Run");
+  });
+  document.getElementById("aiModel").addEventListener("change", async e => {
+    const mm = MODELS[e.target.value]; ai.sess = null; await aiLoad(MODEL_BASE + mm[0], mm[1]);
   });
   document.getElementById("aiConf").addEventListener("input", e => { ai.thr = e.target.value / 100; document.getElementById("aiConfV").textContent = e.target.value + "%"; });
   document.getElementById("aiSize").addEventListener("change", e => { ai.size = +e.target.value; ai.ms = 0; });
