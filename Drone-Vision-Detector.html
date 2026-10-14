@@ -160,7 +160,7 @@
   <div class="livebar" id="aibar">
     <span id="aiStat">AI model: not loaded</span>
     <label>Model <select id="aiModel"><option value="close" selected>A20 trained (your drone)</option><option value="sky">sky / outdoor (DJI-type)</option></select></label>
-    <label>Min confidence <input type="range" id="aiConf" min="10" max="80" value="45"> <span id="aiConfV">45%</span></label>
+    <label>Min confidence <input type="range" id="aiConf" min="10" max="80" value="30"> <span id="aiConfV">30%</span></label>
     <label>Input <select id="aiSize"><option value="320">320 fast</option><option value="480" selected>480 balanced</option><option value="640">640 tiny / very far</option></select></label>
     <label>Own model <input type="file" id="aiFile" accept=".onnx"></label>
   </div>
@@ -836,10 +836,10 @@
   const ORT_VER = "1.20.1";
   const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VER + "/dist/ort.webgpu.min.js";
   const MODEL_BASE = "https://cdn.jsdelivr.net/gh/Smitsajariya/drone-detection-project@2147b81fe695/models/";
-  const MODELS = { close: ["drone-yolov8n.onnx", "general", 45], sky: ["drone-yolov8n-sky.onnx", "sky", 40] };
+  const MODELS = { close: ["drone-yolov8n.onnx", "A20", 30], sky: ["drone-yolov8n-sky.onnx", "sky", 40] };
   const MODEL_URL = MODEL_BASE + MODELS.close[0];
   const btnAI = document.getElementById("btnAI"), aibar = document.getElementById("aibar"), aiStat = document.getElementById("aiStat");
-  const ai = { on: false, sess: null, busy: false, loading: false, dets: [], n: 0, used: -1, trk: null, seen: 0, ms: 0, size: 480, thr: 0.45, nc: 1, locked: false };
+  const ai = { on: false, sess: null, busy: false, loading: false, dets: [], n: 0, used: -1, trk: null, seen: 0, ms: 0, size: 480, thr: 0.30, nc: 1, locked: false };
   const pre = document.createElement("canvas"), pctx = pre.getContext("2d", { willReadFrequently: true });
   function loadScript(u) { return new Promise((res, rej) => { const sc = document.createElement("script"); sc.src = u; sc.onload = res; sc.onerror = () => rej(new Error("could not load " + u)); document.head.appendChild(sc); }); }
   async function aiLoad(src, label) {
@@ -893,6 +893,7 @@
         for (let c = 0; c < nc; c++) { const v = od[(4 + c)*N + k]; if (v > best) { best = v; bc = c; } }
         if (best < ai.thr) continue;
         const cx = od[k], cy = od[N + k], w = od[2*N + k], h = od[3*N + k];
+        if (w / h < 0.8) continue;   // drones are wider than tall; reject thin vertical shapes (hanging cords / wires / cables)
         cand.push({ x: (cx - w/2 - px) / sc / vw, y: (cy - h/2 - py) / sc / vh, w: w / sc / vw, h: h / sc / vh, s: best, c: bc });
       }
       cand.sort((a, b) => b.s - a.s);
